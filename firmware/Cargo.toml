@@ -1,0 +1,52 @@
+[package]
+name = "firmware"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "0xCB-1337 rev5.0 media controller firmware (RP2040, Embassy)."
+
+[[bin]]
+name = "firmware"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+proto = { path = "../proto" }
+
+# Embassy — versions match embassy-rs/embassy main as of May 2026.
+embassy-rp        = { version = "0.10.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
+embassy-executor  = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
+embassy-time      = { version = "0.5.1",  features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync      = { version = "0.8.0",  features = ["defmt"] }
+embassy-usb       = { version = "0.6.0",  features = ["defmt"] }
+embassy-futures   = { version = "0.1.2" }
+
+# OLED + graphics (added as later milestones land)
+ssd1306 = { version = "0.10.0", features = ["async"] }
+embedded-graphics = "0.8.1"
+
+# USB / HID descriptor types
+usbd-hid = "0.10.0"
+
+# WS2812 chain
+smart-leds = "0.4.0"
+
+# Wire framing
+postcard = { version = "1", default-features = false }
+heapless = { version = "0.8", features = ["serde"] }
+
+# Logging + panic
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+
+# Cortex-M runtime
+cortex-m = { version = "0.7.6", features = ["inline-asm"] }
+cortex-m-rt = "0.7.5"
+critical-section = "1.1"
+static_cell = "2.1.1"
+# RP2040 (Cortex-M0+) has no native atomic CAS. portable-atomic emulates it
+# via the critical-section impl provided by embassy-rp's `critical-section-impl`
+# feature. Required so static_cell, embassy-sync, etc. compile for thumbv6m.
+portable-atomic = { version = "1.5", features = ["critical-section"] }

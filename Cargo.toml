@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["proto", "firmware", "host"]
+
+# Default to building only `host` and `proto` in workspace-wide commands so
+# `cargo check` doesn't try to cross-compile firmware to thumbv6m without a
+# target arg. Use `cargo check -p firmware` (or `cd firmware && cargo check`)
+# for the firmware crate, which has its own .cargo/config.toml setting the
+# correct target.
+default-members = ["proto", "host"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/0xCB-media/0xCB-media"
+authors = ["Nickolaj <nickolaj1177@gmail.com>"]
+
+[profile.release]
+debug = true            # keep symbols for probe-rs / defmt
+lto = "fat"
+codegen-units = 1
+opt-level = "z"         # firmware size matters; host is fine with this too
+
+[profile.dev]
+debug = true
+opt-level = 1           # async generators inflate badly at opt-level=0

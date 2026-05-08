@@ -1,0 +1,23 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "0xCB-media Linux daemon: bridges MPRIS now-playing data to the macropad over USB CDC ACM."
+
+# Both binaries live under src/bin/ — cargo auto-detects them by file name.
+#   src/bin/0xcb-media-host.rs        → the daemon (M8)
+#   src/bin/0xcb-media-test-send.rs   → manual postcard frame sender (M7 helper)
+
+[dependencies]
+proto = { path = "../proto" }
+
+anyhow = "1"
+heapless = "0.8"
+postcard = "1"
+serialport = "4"
+clap = { version = "4", features = ["derive", "env"] }
+crossbeam-channel = "0.5"
+mpris = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

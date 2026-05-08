@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+*.uf2
+
+# probe-rs / defmt
+*.bin
+.embed.toml.bak
+
+# direnv / nix
+.direnv
+.envrc.local
+result
+result-*
+
+# editor scratch
+.idea/
+.vscode/
+!.vscode/launch.json
+!.vscode/extensions.json
+.zed/
+*.swp
+*.swo
