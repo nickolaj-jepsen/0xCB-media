@@ -1,6 +1,13 @@
 {
   description = "0xCB-media — RP2040 media controller firmware + Linux host daemon";
 
+  nixConfig = {
+    extra-substituters = [ "https://0xcbmedia.cachix.org" ];
+    extra-trusted-public-keys = [
+      "0xcbmedia.cachix.org-1:u8PfgqbbO/hjnsA77TCxi5w7hh82dApsqJ4bAgg9Rmo="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
