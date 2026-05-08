@@ -90,6 +90,12 @@ static CONSUMER_EVENTS: Channel<CriticalSectionRawMutex, ConsumerKey, 8> = Chann
 pub enum LedCommand {
     /// Flash the per-key LED at this index (0..=7).
     KeyPress { led: u8 },
+    /// Show the underglow ring as a volume gauge for a moment, then fade
+    /// out. The actual level is read from `DISPLAY_STATE` at render time.
+    VolumeChanged,
+    /// The host just toggled mute on. Paint a red backdrop that fades to
+    /// black across the underglow ring.
+    Muted,
 }
 
 static LED_EVENTS: Channel<CriticalSectionRawMutex, LedCommand, 16> = Channel::new();
@@ -182,7 +188,14 @@ fn apply_host_message(msg: HostToDevice) {
                 s.track = Some(TrackInfo { title, artist, is_playing });
             }
             HostToDevice::Volume { level, muted } => {
+                let prev_muted = s.volume.muted;
                 s.volume = VolumeInfo { level, muted };
+                let event = if muted && !prev_muted {
+                    LedCommand::Muted
+                } else {
+                    LedCommand::VolumeChanged
+                };
+                let _ = LED_EVENTS.try_send(event);
             }
             HostToDevice::Clear => {
                 s.track = None;
@@ -462,6 +475,29 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
     const ACCENT_PERKEY: RGB8 = RGB8 { r: 96, g: 12, b: 0 };
     const PRESS_DECAY: u8 = 18;
     const TICK_MS: u64 = 16; // ~60 Hz idle/press render
+    // Volume gauge: when the host pushes a Volume frame, fill the underglow
+    // ring proportionally to `level / 100`. Held at full intensity for
+    // VOL_GAUGE_HOLD_MS, then fades to black across VOL_GAUGE_FADE_MS so the
+    // ring returns to the idle dark state. Sub-LED precision (1 LED = 256
+    // units) keeps the leading edge smooth at 1 % volume increments.
+    const VOL_GAUGE_HOLD_MS: u32 = 1500;
+    const VOL_GAUGE_FADE_MS: u32 = 700;
+    const VOL_GAUGE_TOTAL_MS: u64 = (VOL_GAUGE_HOLD_MS + VOL_GAUGE_FADE_MS) as u64;
+    // Where the gauge starts (gauge cell 0) and which way it wraps. The
+    // underglow chain enters at ~9 o'clock (chain LED 8) and runs anti-
+    // clockwise around the perimeter, so chain offset 5 (= LED 13, the
+    // SPIRAL_PIVOT) is roughly 6 o'clock; flipping `GAUGE_REVERSED` walks
+    // the chain backwards so the visual sweep goes clockwise.
+    const GAUGE_START_OFFSET: u32 = 22;
+    const GAUGE_REVERSED: bool = true;
+    // Mute effect: a red backdrop that fades linearly to black.
+    const MUTE_FADE_MS: u32 = 1000;
+    const MUTE_COLOR: RGB8 = RGB8 { r: 140, g: 0, b: 0 };
+
+    enum UnderglowEffect {
+        Gauge(Instant),
+        Mute(Instant),
+    }
 
     let mut frame = [RGB8::default(); NUM_LEDS];
 
@@ -479,14 +515,25 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
     ws2812.write(&frame).await;
 
     let mut press_brightness: [u8; 8] = [0; 8];
+    let mut effect: Option<UnderglowEffect> = None;
     let mut ticker = Ticker::every(Duration::from_millis(TICK_MS));
 
     loop {
         ticker.next().await;
 
-        while let Ok(LedCommand::KeyPress { led }) = LED_EVENTS.try_receive() {
-            if (led as usize) < PER_KEY_END {
-                press_brightness[led as usize] = 255;
+        while let Ok(cmd) = LED_EVENTS.try_receive() {
+            match cmd {
+                LedCommand::KeyPress { led } => {
+                    if (led as usize) < PER_KEY_END {
+                        press_brightness[led as usize] = 255;
+                    }
+                }
+                LedCommand::VolumeChanged => {
+                    effect = Some(UnderglowEffect::Gauge(Instant::now()));
+                }
+                LedCommand::Muted => {
+                    effect = Some(UnderglowEffect::Mute(Instant::now()));
+                }
             }
         }
 
@@ -499,8 +546,71 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
             };
             press_brightness[i] = press_brightness[i].saturating_sub(PRESS_DECAY);
         }
-        for i in UNDERGLOW_START..NUM_LEDS {
-            frame[i] = RGB8::default();
+
+        match effect {
+            Some(UnderglowEffect::Mute(start))
+                if start.elapsed() < Duration::from_millis(MUTE_FADE_MS as u64) =>
+            {
+                let elapsed = start.elapsed().as_millis() as u32;
+                let envelope = 255 - (elapsed * 255) / MUTE_FADE_MS;
+                let color = RGB8 {
+                    r: ((MUTE_COLOR.r as u32 * envelope) / 255) as u8,
+                    g: ((MUTE_COLOR.g as u32 * envelope) / 255) as u8,
+                    b: ((MUTE_COLOR.b as u32 * envelope) / 255) as u8,
+                };
+                for i in UNDERGLOW_START..NUM_LEDS {
+                    frame[i] = color;
+                }
+            }
+            Some(UnderglowEffect::Gauge(start))
+                if start.elapsed() < Duration::from_millis(VOL_GAUGE_TOTAL_MS) =>
+            {
+                let elapsed = start.elapsed().as_millis() as u32;
+                let envelope = if elapsed < VOL_GAUGE_HOLD_MS {
+                    255
+                } else {
+                    let into_fade = elapsed - VOL_GAUGE_HOLD_MS;
+                    255 - (into_fade * 255) / VOL_GAUGE_FADE_MS
+                };
+                let level = DISPLAY_STATE.lock(|s| {
+                    let s = s.borrow();
+                    if s.volume.muted {
+                        0u32
+                    } else {
+                        s.volume.level.min(100) as u32
+                    }
+                });
+                let fill_units = (level * UNDERGLOW_COUNT as u32 * 256) / 100;
+                let count = UNDERGLOW_COUNT as u32;
+                for i in 0..UNDERGLOW_COUNT {
+                    let led_start = i as u32 * 256;
+                    let intensity = if fill_units >= led_start + 256 {
+                        255
+                    } else if fill_units > led_start {
+                        ((fill_units - led_start) * 255) / 256
+                    } else {
+                        0
+                    };
+                    let factor = (intensity * envelope) / 255;
+                    let gauge_step = i as u32;
+                    let chain_offset = if GAUGE_REVERSED {
+                        (GAUGE_START_OFFSET + count - gauge_step) % count
+                    } else {
+                        (GAUGE_START_OFFSET + gauge_step) % count
+                    };
+                    frame[UNDERGLOW_START + chain_offset as usize] = RGB8 {
+                        r: ((ACCENT_UNDERGLOW.r as u32 * factor) / 255) as u8,
+                        g: ((ACCENT_UNDERGLOW.g as u32 * factor) / 255) as u8,
+                        b: ((ACCENT_UNDERGLOW.b as u32 * factor) / 255) as u8,
+                    };
+                }
+            }
+            _ => {
+                effect = None;
+                for i in UNDERGLOW_START..NUM_LEDS {
+                    frame[i] = RGB8::default();
+                }
+            }
         }
 
         ws2812.write(&frame).await;
