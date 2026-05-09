@@ -695,6 +695,8 @@ fn pw_run(slot: &VizSlot, fps: u32, source: Option<&str>) -> Result<()> {
         send_interval: Duration::from_micros(1_000_000 / fps as u64),
         slot: slot.clone(),
         format: spa::param::audio::AudioInfoRaw::new(),
+        last_audible: Instant::now() - Duration::from_secs(1),
+        is_silent: true,
     };
 
     let _listener = stream
@@ -745,6 +747,29 @@ fn pw_run(slot: &VizSlot, fps: u32, source: Option<&str>) -> Result<()> {
                 return;
             }
             ud.ring.read_latest(FFT_SIZE, &mut ud.input_buf);
+
+            // Silence gate: peak amplitude over the raw window. ≥ -55 dBFS
+            // (~0.00178 linear) counts as audible. After 500 ms below the
+            // floor, drop the slot to None so the device's `last_visualizer`
+            // ages out and the OLED bars vanish.
+            let peak = ud.input_buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            if peak >= SILENCE_THRESHOLD {
+                ud.last_audible = Instant::now();
+                if ud.is_silent {
+                    debug!("viz: audio resumed (peak={:.4})", peak);
+                    ud.is_silent = false;
+                }
+            } else if !ud.is_silent
+                && ud.last_audible.elapsed() >= Duration::from_millis(SILENCE_HOLD_MS)
+            {
+                debug!("viz: audio silent for {} ms; pausing", SILENCE_HOLD_MS);
+                ud.slot.store(None);
+                ud.is_silent = true;
+            }
+            if ud.is_silent {
+                return;
+            }
+
             apply_window(&mut ud.input_buf, &ud.window);
             if ud
                 .fft
@@ -797,6 +822,15 @@ fn pw_run(slot: &VizSlot, fps: u32, source: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Linear amplitude floor (≈ -55 dBFS) below which a window is treated as
+/// silent. Peak rather than RMS — slightly cheaper and equally good for
+/// "anything audible vs nothing playing".
+const SILENCE_THRESHOLD: f32 = 0.00178;
+/// How long the peak must stay below the threshold before we pause emission.
+/// Long enough that a quiet rest in a track doesn't drop the bars; short
+/// enough that the OLED reverts within ~half a second of pause.
+const SILENCE_HOLD_MS: u64 = 500;
+
 struct VizUserData {
     fft: Arc<dyn realfft::RealToComplex<f32>>,
     window: Vec<f32>,
@@ -807,6 +841,8 @@ struct VizUserData {
     smoothed: [f32; 8],
     last_emit: Instant,
     send_interval: Duration,
+    last_audible: Instant,
+    is_silent: bool,
     slot: VizSlot,
     format: pipewire::spa::param::audio::AudioInfoRaw,
 }
