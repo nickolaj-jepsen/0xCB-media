@@ -12,6 +12,13 @@ use serde::{Deserialize, Serialize};
 /// variant (a `Visualizer` with 8 bands).
 pub const MAX_FRAME_LEN: usize = 256;
 
+/// Wire-format version. Bumped when the meaning of an existing variant
+/// changes, capacities shift, or `MAX_FRAME_LEN` moves. Appending a new
+/// variant at the end of either enum is forward-compatible (postcard returns
+/// `Err` on the older side, which both decoders already log+drop) and does
+/// not require a version bump.
+pub const PROTO_VERSION: u8 = 1;
+
 /// Messages flowing host → device.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum HostToDevice {
@@ -27,6 +34,12 @@ pub enum HostToDevice {
     Visualizer {
         bands: [u8; 8],
     },
+    /// Sent by the host once per serial connect. The firmware echoes a
+    /// `DeviceToHost::Hello` so the daemon can log version drift. Mismatch is
+    /// non-fatal in v1 — both sides log and continue.
+    Hello {
+        proto_version: u8,
+    },
 }
 
 /// Messages flowing device → host.
@@ -34,4 +47,9 @@ pub enum HostToDevice {
 pub enum DeviceToHost {
     Pong,
     EncoderClick,
+    /// Reply to `HostToDevice::Hello`. Reports the version the firmware was
+    /// compiled against.
+    Hello {
+        proto_version: u8,
+    },
 }

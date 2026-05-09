@@ -138,6 +138,22 @@ fn serial_loop(device: &str, baud: u32, rx: Receiver<HostToDevice>, viz: VizSlot
             }
         };
         info!("serial connected");
+        // Greet the device. The firmware replies with its own Hello carrying
+        // its compiled-against PROTO_VERSION; mismatches are logged below.
+        match postcard::to_slice_cobs(
+            &HostToDevice::Hello {
+                proto_version: proto::PROTO_VERSION,
+            },
+            &mut tx_buf,
+        ) {
+            Ok(frame) => {
+                if let Err(e) = port.write_all(frame) {
+                    warn!("hello write failed: {}; reopening", e);
+                    continue;
+                }
+            }
+            Err(e) => warn!("postcard encode (hello) failed: {}", e),
+        }
         // Frame state resets per connection — partial bytes from a dead
         // session aren't relevant to a fresh one.
         let mut rx_pos: usize = 0;
@@ -238,6 +254,17 @@ fn handle_device_message(msg: DeviceToHost) {
             // already fires from the firmware.
         }
         DeviceToHost::Pong => debug!("device → host: pong"),
+        DeviceToHost::Hello { proto_version } => {
+            if proto_version == proto::PROTO_VERSION {
+                info!("device proto version: {}", proto_version);
+            } else {
+                warn!(
+                    "device proto version {} != host {}; continuing",
+                    proto_version,
+                    proto::PROTO_VERSION
+                );
+            }
+        }
     }
 }
 

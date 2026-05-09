@@ -216,6 +216,18 @@ fn apply_host_message(msg: HostToDevice) {
                 s.bands = bands;
                 s.last_visualizer = Instant::now();
             }
+            HostToDevice::Hello { proto_version } => {
+                if proto_version != proto::PROTO_VERSION {
+                    defmt::warn!(
+                        "host proto version {} != firmware {}; continuing",
+                        proto_version,
+                        proto::PROTO_VERSION
+                    );
+                }
+                let _ = DEVICE_TX_EVENTS.try_send(DeviceToHost::Hello {
+                    proto_version: proto::PROTO_VERSION,
+                });
+            }
         }
     });
 }
