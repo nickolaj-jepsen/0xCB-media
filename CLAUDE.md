@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Cargo workspace with three crates targeting two architectures:
 
 - `firmware/` — `no_std`, Embassy-on-RP2040, target `thumbv6m-none-eabi`. Composite USB device (HID Consumer Control + CDC ACM). Runs on a 0xCB-1337 rev5.0 macropad.
-- `host/` — Linux-only daemon binary (`0xcb-media-host`) plus a manual test sender (`0xcb-media-test-send`). Streams `wpctl` volume + an FFT audio visualizer to the macropad over CDC ACM.
+- `host/` — Linux-only daemon binary (`0xcb-media-host`) plus a manual test sender (`0xcb-media-test-send`). Streams the default sink's PipeWire volume + an FFT audio visualizer to the macropad over CDC ACM.
 - `proto/` — `no_std`-friendly serde schema (`HostToDevice`, `DeviceToHost`) shared between the two. Wire format: postcard + COBS framing, one frame per `0x00` delimiter, `MAX_FRAME_LEN = 256`.
 
 `Cargo.toml` sets `default-members = ["proto", "host"]` so workspace-wide commands skip the firmware (which can't cross-compile without its own target config).
@@ -86,7 +86,7 @@ The firmware flips its OLED to "Disconnected" after 5 s without any host frame. 
 
 `host/src/bin/0xcb-media-host.rs` — two blocking source threads (`volume`, `ping`) plus an FFT viz thread feed the device. Volume/ping push into a bounded `crossbeam_channel` of `HostToDevice`; the viz thread stores its latest 8-band frame into a lock-free `ArcSwapOption` slot. A single serial loop drains both, COBS-encodes, and writes. The same loop also reads `DeviceToHost` frames (currently logs `EncoderClick`). Reopens the port with 2 s backoff on any I/O error.
 
-Volume comes from shelling out to `wpctl get-volume @DEFAULT_AUDIO_SINK@` and parsing `Volume: 0.47 [MUTED]?`. The daemon depends on PipeWire/WirePlumber being installed on the host. The visualizer captures the default sink monitor via `pipewire`/`libspa`, runs a windowed real-FFT (`realfft`), and bins to 8 log-spaced dB-scaled bands.
+Volume is sourced natively via `pipewire`/`libspa`: a separate mainloop watches the `default` Metadata's `default.audio.sink` property, binds a `Node` proxy to the resolved sink, and listens for `Props` param changes (`channelVolumes`, `mute`). The linear `channelVolumes` is cube-rooted to match `wpctl`'s display. The daemon only needs PipeWire on the host. The visualizer captures the default sink monitor via the same crates, runs a windowed real-FFT (`realfft`), and bins to 8 log-spaced dB-scaled bands.
 
 `OXCB_MEDIA_SERIAL` env var sets the device path (NixOS module wires this).
 

@@ -15,8 +15,8 @@ deferred work.
 
 | Need | Picked | Why |
 |------|--------|-----|
-| Volume reading | shell out to `wpctl get-volume @DEFAULT_AUDIO_SINK@` | One process call every 250 ms, no native deps beyond what's already on a PipeWire system. `pulsectl` / `pipewire-rs` were considered for this and rejected because they pull native lib bindings for ~3 lines of saved code. |
-| Audio capture for FFT | [`pipewire`](https://docs.rs/pipewire) (real bindings, via `libspa`) | We need raw float samples from the default sink monitor, which means a real PipeWire stream. The wpctl shell-out is fine for a scalar reading; for sample data we need the real thing. |
+| Volume reading | native `pipewire`/`libspa` registry → default-sink `Node` Props subscription | Push-based (no polling), zero subprocesses, no `wireplumber` runtime dep. We already pull `pipewire`/`libspa` for the visualizer, so adding the volume monitor is just a second mainloop on a new thread. |
+| Audio capture for FFT | [`pipewire`](https://docs.rs/pipewire) (real bindings, via `libspa`) | We need raw float samples from the default sink monitor, which means a real PipeWire stream. |
 | FFT | [`realfft`](https://docs.rs/realfft) | Real-input FFT (half-spectrum output). 1024-point window at typical 48 kHz = ~21 ms latency, plenty fast at 60 Hz output. |
 | Wire framing | `postcard` + COBS | See [`02-firmware-stack.md`](02-firmware-stack.md#wire-protocol-postcard--cobs). |
 | Concurrency | `std::thread` + `crossbeam-channel` for control frames, `arc-swap` for the latest viz frame | We have ≤4 long-lived threads, no async story is needed. The viz frame is "always replace, last writer wins" so a lock-free `ArcSwapOption<[u8; 8]>` keeps the serial loop from ever blocking on the FFT thread. |
@@ -57,7 +57,7 @@ Threads:
 
 | Thread | What | When |
 |--------|------|------|
-| `volume` | Run `wpctl get-volume @DEFAULT_AUDIO_SINK@`, parse, send `Volume` if changed. | Every 250 ms (configurable via `--volume-poll-ms`). |
+| `volume` | PipeWire mainloop. Walks the registry to find the `default` Metadata, reads its `default.audio.sink` JSON property to resolve the sink node name, binds a `Node` proxy, and listens on `Props` for `channelVolumes` + `mute` changes. Cube-roots the linear `channelVolumes` to match `wpctl`'s display, sends `Volume` if changed. Re-binds on default-sink switch. | Push-based (PipeWire callback). |
 | `ping` | Send `Ping`. | Every 2 s (configurable via `--ping-interval-s`). Firmware times out at 5 s, so any value ≤4 keeps it happy. |
 | `viz` | PipeWire capture stream on the default sink monitor (or `--visualizer-source`); buffers samples in a small ring; on each callback, runs a Hann-windowed real-FFT over the most recent 1024 samples, bins to 8 log-spaced bands (~40 Hz to 16 kHz), dB-scales, attack/release smooths, and stores the latest `[u8; 8]` into the lock-free slot. | Driven by PipeWire callbacks; output rate-limited to `--visualizer-fps` (default 60, clamped 15..=120). |
 | main | Reads port (10 ms timeout) → decodes any `DeviceToHost` frames; pumps the latest viz frame if changed; then `recv_timeout(5 ms)` for control TX → COBS-frames + writes. | Continuous interleaved poll. |
@@ -91,7 +91,8 @@ Frames are zero-byte delimited on the wire.
 ### Cadence
 
 - **Host → device:**
-  - `Volume` whenever the polled wpctl reading changes.
+  - `Volume` whenever the PipeWire `Props` callback reports a new
+    `channelVolumes` or `mute` value on the bound default sink.
   - `Ping` every 2 s — keepalive to prevent the firmware's 5 s
     "Disconnected" UI fallback.
   - `Visualizer` at up to 60 Hz while audio is flowing on the default sink.

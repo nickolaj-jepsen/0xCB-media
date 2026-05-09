@@ -1,16 +1,19 @@
-//! 0xcb-media-host — Linux daemon that streams the current PipeWire /
-//! PulseAudio default-sink volume and an FFT-based audio visualizer to the
-//! 0xCB-1337 macropad over USB CDC ACM. Designed to run as a per-user systemd
-//! service via the NixOS module in this repo's `flake.nix`.
+//! 0xcb-media-host — Linux daemon that streams the current PipeWire default
+//! sink's volume and an FFT-based audio visualizer to the 0xCB-1337 macropad
+//! over USB CDC ACM. Designed to run as a per-user systemd service via the
+//! NixOS module in this repo's `flake.nix`.
 //!
-//! Architecture: two blocking source threads (`volume`, `ping`) plus the viz
-//! thread emit `proto::HostToDevice` messages — control frames into a bounded
-//! channel and viz frames into a lock-free `ArcSwapOption` slot. The main
-//! thread drains both and writes COBS-framed postcard frames to the serial
-//! port, with simple reopen-on-error reconnect.
+//! Architecture: two source threads (a PipeWire `volume` mainloop and a
+//! `ping` keepalive) plus the viz thread emit `proto::HostToDevice`
+//! messages — control frames into a bounded channel and viz frames into a
+//! lock-free `ArcSwapOption` slot. The main thread drains both and writes
+//! COBS-framed postcard frames to the serial port, with simple
+//! reopen-on-error reconnect.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,10 +44,6 @@ struct Args {
     /// Baud rate. CDC ACM ignores this but `serialport` still wants a value.
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
-
-    /// How often (ms) to poll `wpctl` for system volume.
-    #[arg(long, default_value_t = 250)]
-    volume_poll_ms: u64,
 
     /// Keepalive interval (s). Firmware flips to "Disconnected" UI after 5 s
     /// of silence, so anything ≤ 4 keeps it happy.
@@ -84,10 +83,9 @@ fn main() -> Result<()> {
 
     {
         let tx = tx.clone();
-        let interval = Duration::from_millis(args.volume_poll_ms);
         thread::Builder::new()
             .name("volume".into())
-            .spawn(move || run_volume(tx, interval))
+            .spawn(move || run_volume_pipewire(tx))
             .context("spawn volume thread")?;
     }
     {
@@ -327,44 +325,297 @@ fn handle_device_message(msg: DeviceToHost) {
 }
 
 // ─── Volume source thread ──────────────────────────────────────────────────
+//
+// Native PipeWire volume tracker. Walks the registry to find the default
+// audio sink (via the `default` Metadata's `default.audio.sink` JSON
+// property), binds a Node proxy to it, subscribes to its `Props` param, and
+// pushes `HostToDevice::Volume { level, muted }` whenever channelVolumes or
+// mute change. Re-binds on default-sink switches so the OLED keeps tracking
+// after `pactl set-default-sink`.
 
-fn run_volume(tx: Sender<HostToDevice>, interval: Duration) {
-    let mut last: Option<(u8, bool)> = None;
+fn run_volume_pipewire(tx: Sender<HostToDevice>) {
+    pipewire::init();
     loop {
-        if let Some(reading) = poll_wpctl_volume() {
-            if last != Some(reading) {
-                debug!("volume: level={} muted={}", reading.0, reading.1);
-                let _ = tx.try_send(HostToDevice::Volume {
-                    level: reading.0,
-                    muted: reading.1,
-                });
-                last = Some(reading);
-            }
+        match pw_volume_run(&tx) {
+            Ok(()) => debug!("pipewire volume loop exited cleanly"),
+            Err(e) => warn!("pipewire volume error: {}; retry in 2 s", e),
         }
-        thread::sleep(interval);
+        thread::sleep(Duration::from_secs(2));
     }
 }
 
-/// `wpctl get-volume @DEFAULT_AUDIO_SINK@` returns either:
-///     "Volume: 0.47\n"
-///     "Volume: 0.47 [MUTED]\n"
-/// We parse the float, multiply by 100, clamp to u8.
-fn poll_wpctl_volume() -> Option<(u8, bool)> {
-    let output = Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+/// State shared between the registry / metadata / node listeners. All
+/// callbacks run on the same thread (the pipewire mainloop), so an
+/// `Rc<RefCell<…>>` is sufficient — no atomics needed.
+struct VolState {
+    tx: Sender<HostToDevice>,
+    last_sent: Option<(u8, bool)>,
+    last_muted: bool,
+    last_max_volume: f32,
+    /// Sink node name resolved from `default.audio.sink` metadata.
+    default_sink_name: Option<String>,
+    /// Registry id → node name, accumulated as `global` events arrive.
+    nodes_by_id: HashMap<u32, String>,
+    /// Keep proxies + listeners alive for the duration of the loop.
+    metadata: Option<(
+        pipewire::metadata::Metadata,
+        pipewire::metadata::MetadataListener,
+    )>,
+    node: Option<(pipewire::node::Node, pipewire::node::NodeListener)>,
+    bound_node_id: Option<u32>,
+}
+
+fn pw_volume_run(tx: &Sender<HostToDevice>) -> Result<()> {
+    use pipewire as pw;
+
+    let mainloop = pw::main_loop::MainLoop::new(None).context("MainLoop::new")?;
+    let context = pw::context::Context::new(&mainloop).context("Context::new")?;
+    let core = context.connect(None).context("Context::connect")?;
+    let registry = Rc::new(core.get_registry().context("Core::get_registry")?);
+
+    let state = Rc::new(RefCell::new(VolState {
+        tx: tx.clone(),
+        last_sent: None,
+        last_muted: false,
+        last_max_volume: 0.0,
+        default_sink_name: None,
+        nodes_by_id: HashMap::new(),
+        metadata: None,
+        node: None,
+        bound_node_id: None,
+    }));
+
+    let _global_listener = {
+        let state = state.clone();
+        let registry_for_global = registry.clone();
+        let state_for_remove = state.clone();
+        registry
+            .add_listener_local()
+            .global(move |obj| on_registry_global(obj, &state, &registry_for_global))
+            .global_remove(move |id| on_registry_remove(id, &state_for_remove))
+            .register()
+    };
+
+    mainloop.run();
+    Ok(())
+}
+
+fn on_registry_global(
+    obj: &pipewire::registry::GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+    state: &Rc<RefCell<VolState>>,
+    registry: &Rc<pipewire::registry::Registry>,
+) {
+    use pipewire::types::ObjectType;
+
+    match &obj.type_ {
+        ObjectType::Metadata => {
+            // Only care about the `default` metadata (where default.audio.sink lives).
+            let is_default = obj
+                .props
+                .as_ref()
+                .and_then(|p| p.get("metadata.name"))
+                .map(|n| n == "default")
+                .unwrap_or(false);
+            if !is_default {
+                return;
+            }
+            let proxy: pipewire::metadata::Metadata = match registry.bind(obj) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("bind metadata failed: {}", e);
+                    return;
+                }
+            };
+            let listener = {
+                let state = state.clone();
+                let registry = registry.clone();
+                proxy
+                    .add_listener_local()
+                    .property(move |_subject, key, _type, value| {
+                        if key == Some("default.audio.sink") {
+                            let name = value.and_then(parse_default_sink_name);
+                            on_default_sink_changed(name, &state, &registry);
+                        }
+                        0
+                    })
+                    .register()
+            };
+            state.borrow_mut().metadata = Some((proxy, listener));
+        }
+        ObjectType::Node => {
+            let Some(name) = obj.props.as_ref().and_then(|p| p.get("node.name")) else {
+                return;
+            };
+            let name = name.to_string();
+            let id = obj.id;
+            let mut s = state.borrow_mut();
+            s.nodes_by_id.insert(id, name.clone());
+            // If we already know the default sink name and it's this node, bind it.
+            if s.default_sink_name.as_deref() == Some(&name) && s.bound_node_id != Some(id) {
+                drop(s);
+                bind_sink_node(id, state, registry);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn on_registry_remove(id: u32, state: &Rc<RefCell<VolState>>) {
+    let mut s = state.borrow_mut();
+    s.nodes_by_id.remove(&id);
+    if s.bound_node_id == Some(id) {
+        s.node = None;
+        s.bound_node_id = None;
+    }
+}
+
+fn on_default_sink_changed(
+    name: Option<String>,
+    state: &Rc<RefCell<VolState>>,
+    registry: &Rc<pipewire::registry::Registry>,
+) {
+    let target_id = {
+        let mut s = state.borrow_mut();
+        s.default_sink_name = name.clone();
+        match name {
+            Some(n) => s
+                .nodes_by_id
+                .iter()
+                .find(|(_, v)| v.as_str() == n)
+                .map(|(k, _)| *k),
+            None => None,
+        }
+    };
+    let Some(id) = target_id else { return };
+    if state.borrow().bound_node_id != Some(id) {
+        bind_sink_node(id, state, registry);
+    }
+}
+
+fn bind_sink_node(
+    id: u32,
+    state: &Rc<RefCell<VolState>>,
+    registry: &Rc<pipewire::registry::Registry>,
+) {
+    use pipewire::spa::param::ParamType;
+
+    // Re-issue a registry::bind by id by faking a GlobalObject. Simpler path:
+    // call the raw spa interface via `Registry::bind` only when we have the
+    // GlobalObject; here we only have the id, so look up via a fresh global
+    // listener pass would be heavy. Instead, fetch a Node proxy via the
+    // typed binder by creating a minimal owned GlobalObject.
+    let owned = pipewire::registry::GlobalObject {
+        id,
+        permissions: pipewire::permissions::PermissionFlags::empty(),
+        type_: pipewire::types::ObjectType::Node,
+        version: 0,
+        props: None::<pipewire::properties::Properties>,
+    };
+    let proxy: pipewire::node::Node = match registry.bind(&owned) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("bind node {} failed: {}", id, e);
+            return;
+        }
+    };
+    proxy.subscribe_params(&[ParamType::Props]);
+
+    let listener = {
+        let state = state.clone();
+        proxy
+            .add_listener_local()
+            .param(move |_seq, id, _index, _next, param| {
+                if id != ParamType::Props {
+                    return;
+                }
+                let Some(pod) = param else { return };
+                if let Some((level, muted)) = parse_props_pod(pod, &state) {
+                    push_volume(level, muted, &state);
+                }
+            })
+            .register()
+    };
+
+    let mut s = state.borrow_mut();
+    s.node = Some((proxy, listener));
+    s.bound_node_id = Some(id);
+    info!("bound default sink node id {}", id);
+}
+
+fn push_volume(level: u8, muted: bool, state: &Rc<RefCell<VolState>>) {
+    let mut s = state.borrow_mut();
+    if s.last_sent == Some((level, muted)) {
+        return;
+    }
+    debug!("volume: level={} muted={}", level, muted);
+    let _ = s.tx.try_send(HostToDevice::Volume { level, muted });
+    s.last_sent = Some((level, muted));
+}
+
+/// Pull `channelVolumes` and `mute` out of a Props pod. Both fields may be
+/// absent on partial updates — fall back to the last seen values stored in
+/// `state`.
+fn parse_props_pod(
+    pod: &pipewire::spa::pod::Pod,
+    state: &Rc<RefCell<VolState>>,
+) -> Option<(u8, bool)> {
+    use libspa::pod::deserialize::PodDeserializer;
+    use libspa::pod::{Value, ValueArray};
+    use libspa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute};
+
+    let (_, value): (_, Value) = PodDeserializer::deserialize_from(pod.as_bytes()).ok()?;
+    let Value::Object(obj) = value else {
+        return None;
+    };
+
+    let mut max_vol: Option<f32> = None;
+    let mut muted: Option<bool> = None;
+
+    for prop in &obj.properties {
+        if prop.key == SPA_PROP_channelVolumes {
+            if let Value::ValueArray(ValueArray::Float(vols)) = &prop.value {
+                max_vol = vols.iter().cloned().fold(None, |acc, v| {
+                    Some(match acc {
+                        None => v,
+                        Some(m) => m.max(v),
+                    })
+                });
+            }
+        } else if prop.key == SPA_PROP_mute {
+            if let Value::Bool(b) = prop.value {
+                muted = Some(b);
+            }
+        }
+    }
+
+    if max_vol.is_none() && muted.is_none() {
         return None;
     }
-    let s = std::str::from_utf8(&output.stdout).ok()?;
-    let mut tokens = s.split_whitespace();
-    let _label = tokens.next()?; // "Volume:"
-    let vol_str = tokens.next()?;
-    let vol: f32 = vol_str.parse().ok()?;
-    let level = (vol * 100.0).round().clamp(0.0, 100.0) as u8;
-    let muted = s.contains("[MUTED]");
-    Some((level, muted))
+
+    let mut s = state.borrow_mut();
+    if let Some(v) = max_vol {
+        s.last_max_volume = v;
+    }
+    if let Some(m) = muted {
+        s.last_muted = m;
+    }
+    let lin = s.last_max_volume.max(0.0);
+    let muted_now = s.last_muted;
+    drop(s);
+    // wpctl displays cubic-mapped volume; cube-root the linear sample so the
+    // user-visible numbers match what they'd see from `wpctl get-volume`.
+    let level = (lin.cbrt() * 100.0).round().clamp(0.0, 100.0) as u8;
+    Some((level, muted_now))
+}
+
+/// Extract `name` from the JSON value PipeWire stores in `default.audio.sink`,
+/// which looks like `{"name":"alsa_output.pci-…"}`. Hand-rolled rather than
+/// pulling in `serde_json` for one field.
+fn parse_default_sink_name(json: &str) -> Option<String> {
+    const NEEDLE: &str = r#""name":""#;
+    let start = json.find(NEEDLE)? + NEEDLE.len();
+    let end = json[start..].find('"')?;
+    Some(json[start..start + end].to_string())
 }
 
 // ─── Ping source thread ────────────────────────────────────────────────────

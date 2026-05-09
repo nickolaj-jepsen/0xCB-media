@@ -79,8 +79,8 @@ Three crates:
    (for the volume + visualizer feed). Drives the OLED, encoder, key matrix,
    and the 31-LED RGB chain.
 2. **`host/`** — Linux daemon (`0xcb-media-host`) that streams the current
-   PipeWire/WirePlumber default-sink volume and an 8-band FFT spectrum of
-   the audio coming out of that sink to the macropad over CDC ACM. Watches
+   PipeWire default-sink volume and an 8-band FFT spectrum of the audio
+   coming out of that sink to the macropad over CDC ACM. Watches
    `DeviceToHost::EncoderClick` from the firmware for custom actions
    (currently just logged).
 3. **`proto/`** — Shared `no_std`-friendly serde schema for the wire format
@@ -102,7 +102,7 @@ backends would need to be added.
 | [`docs/01-hardware.md`](docs/01-hardware.md) | 0xCB-1337 rev5.0 hardware: BOM, pinout, bootloader entry, schematic links |
 | [`docs/02-firmware-stack.md`](docs/02-firmware-stack.md) | Rust toolchain, embassy-rp / embassy-usb / ssd1306 versions actually used, atomic CAS gotcha, crate skeleton |
 | [`docs/03-probe-rs.md`](docs/03-probe-rs.md) | probe.rs install, debug probe options, RP2040 flashing & RTT logging (optional — UF2 was sufficient for v1) |
-| [`docs/04-host-integration.md`](docs/04-host-integration.md) | wpctl + PipeWire FFT daemon design, wire schema, NixOS module deployment |
+| [`docs/04-host-integration.md`](docs/04-host-integration.md) | PipeWire volume tracking + FFT daemon design, wire schema, NixOS module deployment |
 | [`docs/05-architecture.md`](docs/05-architecture.md) | Final firmware task layout, USB descriptors, OLED layout, boot sequence |
 | [`docs/06-implementation-notes.md`](docs/06-implementation-notes.md) | Surprises and gotchas from the actual build — bootmagic-is-firmware, PIO encoder hang, SK6812 vs WS2812B colour, embassy 0.10 API quirks |
 | [`docs/sources.md`](docs/sources.md) | Every URL referenced in the docs |
