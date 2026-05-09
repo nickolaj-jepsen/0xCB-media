@@ -50,11 +50,18 @@ Nix package builds: `nix build .#host` and `nix build .#firmware`. The flake als
 
 When editing firmware, always `cd firmware` first, or use `cargo <cmd> --manifest-path firmware/Cargo.toml` (CI does the latter).
 
-## Firmware architecture (single-file design)
+## Firmware architecture
 
-All firmware lives in `firmware/src/main.rs` (~750 LOC). The original plan called for splitting into modules; it never crossed the threshold where splitting helps. Don't pre-emptively split — the natural seams (if it ever grows) are `proto.rs` (types + channels), `usb.rs` (descriptor + composite setup), one file per task.
+`firmware/src/` is split by responsibility:
 
-Key shared statics that any task can reach:
+- `main.rs` — peripheral init, USB descriptor wiring, task spawns, and the joined display loop / CDC connection loop.
+- `state.rs` — shared statics (`DISPLAY_STATE`, channels) and the types they carry. Every other module imports from here.
+- `display.rs` — OLED rendering, pure functions over a `DisplayState` snapshot.
+- `led.rs` — `led_task` + the WS2812 chain driver and glow visualizer renderers.
+- `input.rs` — `matrix_task`, `encoder_task`, keymap, quadrature lookup.
+- `usb.rs` — `usb_task`, `hid_writer_task`, `cdc_tx_task`, `cdc_rx_loop`, HID report descriptor, `UsbDrv` type alias.
+
+Key shared statics in `state.rs` that any task can reach:
 
 - `CONSUMER_EVENTS` — `Channel<_, ConsumerKey, 8>`. Matrix + encoder push, `hid_writer_task` drains.
 - `LED_EVENTS` — `Channel<_, LedCommand, 16>`. Matrix + CDC RX push, `led_task` drains.
