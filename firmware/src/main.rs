@@ -1,27 +1,21 @@
 #![no_std]
 #![no_main]
 
-//! M7 milestone — the OLED now renders host-driven now-playing data instead
-//! of a static milestone label, and the CDC ACM endpoint accepts COBS-framed
-//! `proto::HostToDevice` messages from the PC daemon.
+//! Composite USB device (HID Consumer Control + CDC ACM). The CDC endpoint
+//! accepts COBS-framed `proto::HostToDevice` messages from the PC daemon —
+//! Volume, Visualizer, Ping — and pushes `DeviceToHost::EncoderClick` back
+//! when the encoder is pressed.
 //!
-//! The composite USB device is unchanged from M3 (CDC + HID), and matrix /
-//! encoder / LED / HID-writer tasks are all carried over from M5 / M6.
-//! What changed:
+//! `DISPLAY_STATE` is the shared state: CDC RX writes, the display loop and
+//! the LED task read, and the matrix task flips `visualizer_enabled` when
+//! the user presses the key below the encoder.
 //!
-//!   * `DISPLAY_STATE` — shared state mutated by CDC, read by the render loop.
-//!   * `cdc_rx_loop` — replaces the M2 echo. Accumulates bytes until a 0x00
-//!     delimiter and decodes the buffer as a postcard-COBS frame.
-//!   * `display_loop` — runs at ~30 Hz: snapshots state, paints status glyph,
-//!     title, artist, and a volume bar (or a "Disconnected" message if the
-//!     host has been silent for 5 s+).
-//!
-//! Both loops run inside `main` via `embassy_futures::join` so they share
-//! ownership of the `CdcAcmClass` and the OLED handle without spawn-lifetime
-//! gymnastics.
+//! The display loop and `cdc_rx_loop` run inside `main` via
+//! `embassy_futures::join` rather than as spawned tasks because the OLED
+//! handle (`Ssd1306Async`) and `CdcReceiver` carry lifetimes that aren't
+//! easily `'static`.
 
 use core::cell::RefCell;
-use core::fmt::Write as _;
 
 use defmt::{info, panic};
 use embassy_executor::Spawner;
@@ -33,14 +27,20 @@ use embassy_rp::i2c::{self, I2c};
 use embassy_rp::peripherals::{DMA_CH0, I2C1, PIN_10, PIN_11, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
-use embassy_rp::usb::{Driver as UsbDriver, Instance as UsbInstance, InterruptHandler as UsbInterruptHandler};
+use embassy_rp::usb::{
+    Driver as UsbDriver, Instance as UsbInstance, InterruptHandler as UsbInterruptHandler,
+};
 use embassy_rp::Peri;
 use embassy_sync::blocking_mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Ticker, Timer};
-use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver as CdcReceiver, Sender as CdcSender, State as CdcState};
-use embassy_usb::class::hid::{Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidStateT};
+use embassy_usb::class::cdc_acm::{
+    CdcAcmClass, Receiver as CdcReceiver, Sender as CdcSender, State as CdcState,
+};
+use embassy_usb::class::hid::{
+    Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidStateT,
+};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::UsbDevice;
 use embedded_graphics::{
@@ -111,9 +111,15 @@ static DEVICE_TX_EVENTS: Channel<CriticalSectionRawMutex, DeviceToHost, 8> = Cha
 /// `0xCB-dev/keeb-firmware-source/vial/1337/v5/info.json`); the encoder
 /// position has no per-key LED, hence the `None`.
 const MATRIX_TO_LED: [Option<u8>; 9] = [
-    Some(1), Some(0), None,    // row 0 (col 2 = encoder click, no LED)
-    Some(2), Some(3), Some(4), // row 1
-    Some(7), Some(6), Some(5), // row 2
+    Some(1),
+    Some(0),
+    None, // row 0 (col 2 = encoder click, no LED)
+    Some(2),
+    Some(3),
+    Some(4), // row 1
+    Some(7),
+    Some(6),
+    Some(5), // row 2
 ];
 
 /// Hand-rolled HID report descriptor: a single application collection on
@@ -137,13 +143,6 @@ const CONSUMER_REPORT_DESCRIPTOR: &[u8] = &[
 
 // ─── Display state ─────────────────────────────────────────────────────────
 
-#[derive(Clone)]
-struct TrackInfo {
-    title: heapless::String<64>,
-    artist: heapless::String<32>,
-    is_playing: bool,
-}
-
 #[derive(Clone, Copy)]
 struct VolumeInfo {
     level: u8, // 0..=100
@@ -152,19 +151,31 @@ struct VolumeInfo {
 
 #[derive(Clone)]
 struct DisplayState {
-    track: Option<TrackInfo>,
     volume: VolumeInfo,
     /// Last time we received any frame from the host. Used to flip the OLED
     /// to "Disconnected" when the daemon dies or the cable is unplugged.
     last_message: Instant,
+    /// Latest spectrum bands from the host. `last_visualizer` gates whether
+    /// they're considered fresh enough to render.
+    bands: [u8; 8],
+    last_visualizer: Instant,
+    /// User toggle (button below the encoder). When false, viz frames from
+    /// the host are accepted but not rendered, so the underglow ring stays
+    /// dark instead of pulsing along with audio.
+    visualizer_enabled: bool,
 }
 
 impl DisplayState {
     const fn new() -> Self {
         Self {
-            track: None,
-            volume: VolumeInfo { level: 0, muted: false },
+            volume: VolumeInfo {
+                level: 0,
+                muted: false,
+            },
             last_message: Instant::from_ticks(0),
+            bands: [0; 8],
+            last_visualizer: Instant::from_ticks(0),
+            visualizer_enabled: true,
         }
     }
 
@@ -173,6 +184,12 @@ impl DisplayState {
         // arrives — `last_message` starts at tick 0.
         self.last_message != Instant::from_ticks(0)
             && self.last_message.elapsed() < Duration::from_secs(5)
+    }
+
+    fn visualizer_active(&self) -> bool {
+        self.visualizer_enabled
+            && self.last_visualizer != Instant::from_ticks(0)
+            && self.last_visualizer.elapsed() < Duration::from_millis(500)
     }
 }
 
@@ -184,9 +201,6 @@ fn apply_host_message(msg: HostToDevice) {
         let mut s = state.borrow_mut();
         s.last_message = Instant::now();
         match msg {
-            HostToDevice::NowPlaying { title, artist, is_playing } => {
-                s.track = Some(TrackInfo { title, artist, is_playing });
-            }
             HostToDevice::Volume { level, muted } => {
                 let prev_muted = s.volume.muted;
                 s.volume = VolumeInfo { level, muted };
@@ -197,10 +211,11 @@ fn apply_host_message(msg: HostToDevice) {
                 };
                 let _ = LED_EVENTS.try_send(event);
             }
-            HostToDevice::Clear => {
-                s.track = None;
-            }
             HostToDevice::Ping => { /* timestamp already updated */ }
+            HostToDevice::Visualizer { bands } => {
+                s.bands = bands;
+                s.last_visualizer = Instant::now();
+            }
         }
     });
 }
@@ -215,10 +230,10 @@ async fn main(spawner: Spawner) {
     let matrix: [Input<'static>; 9] = [
         Input::new(p.PIN_27, Pull::Up), // [0][0]
         Input::new(p.PIN_29, Pull::Up), // [0][1]
-        Input::new(p.PIN_9,  Pull::Up), // [0][2] — encoder click
+        Input::new(p.PIN_9, Pull::Up),  // [0][2] — encoder click
         Input::new(p.PIN_26, Pull::Up), // [1][0]
         Input::new(p.PIN_28, Pull::Up), // [1][1]
-        Input::new(p.PIN_8,  Pull::Up), // [1][2]
+        Input::new(p.PIN_8, Pull::Up),  // [1][2]
         Input::new(p.PIN_18, Pull::Up), // [2][0]
         Input::new(p.PIN_17, Pull::Up), // [2][1]
         Input::new(p.PIN_12, Pull::Up), // [2][2]
@@ -241,7 +256,9 @@ async fn main(spawner: Spawner) {
     Timer::after(Duration::from_millis(20)).await;
 
     // PIO0 / SM0 → WS2812 chain on GP25 (31 LEDs, GRB).
-    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(p.PIO0, Irqs);
     let ws2812_prg = PioWs2812Program::new(&mut common);
     let ws2812 = PioWs2812::<'_, PIO0, 0, NUM_LEDS, Grb>::new(
         &mut common,
@@ -371,46 +388,57 @@ fn render_frame<D>(
         return;
     }
 
-    // Status glyph (top-left, 12px tall slot).
-    let glyph = match snapshot.track.as_ref() {
-        Some(t) if t.is_playing => ">",
-        Some(_) => "||",
-        None => "-",
-    };
-    let _ = Text::with_baseline(glyph, Point::new(2, 0), *text_style, Baseline::Top).draw(display);
-
-    // Title + artist, or a placeholder when no track is set.
-    if let Some(t) = snapshot.track.as_ref() {
-        let _ = Text::with_baseline(&t.title, Point::new(20, 0), *text_style, Baseline::Top).draw(display);
-        let _ = Text::with_baseline(&t.artist, Point::new(20, 16), *text_style, Baseline::Top).draw(display);
-    } else {
-        let _ = Text::with_baseline(
-            "(no track playing)",
-            Point::new(8, 8),
-            *text_style,
-            Baseline::Top,
-        )
-        .draw(display);
+    // Left pane: spectrum bars while audio is flowing. Otherwise the area
+    // stays blank — the right-edge volume bar is the always-on indicator.
+    if snapshot.visualizer_active() {
+        render_visualizer(display, &snapshot.bands);
     }
 
-    // Volume bar — bottom of the panel. Outline + filled inner rect.
-    let outline = Rectangle::new(Point::new(2, 50), Size::new(102, 9))
+    // Vertical volume bar pinned to the right edge. Drawn last so a long
+    // title or a tall spectrum bar can't bleed into it. 8 px wide outline,
+    // 6×58 inner fill anchored to the bottom and growing with the level.
+    let outline = Rectangle::new(Point::new(118, 2), Size::new(8, 60))
         .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1));
     let _ = outline.draw(display);
-
     if snapshot.volume.muted {
-        let _ = Text::with_baseline("MUTE", Point::new(38, 36), *text_style, Baseline::Top).draw(display);
+        // Solid stripe across the middle = muted indicator.
+        let stripe = Rectangle::new(Point::new(118, 30), Size::new(8, 4))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On));
+        let _ = stripe.draw(display);
     } else {
         let level = snapshot.volume.level.min(100) as u32;
         if level > 0 {
-            let inner = Rectangle::new(Point::new(3, 51), Size::new(level, 7))
+            let h = (level * 58 + 50) / 100;
+            let top = 3 + (58 - h) as i32;
+            let inner = Rectangle::new(Point::new(119, top), Size::new(6, h))
                 .into_styled(PrimitiveStyle::with_fill(BinaryColor::On));
             let _ = inner.draw(display);
         }
-        // "Vol nn%" right-aligned-ish above the bar.
-        let mut buf: heapless::String<8> = heapless::String::new();
-        let _ = write!(&mut buf, "{}%", snapshot.volume.level);
-        let _ = Text::with_baseline(&buf, Point::new(108, 50), *text_style, Baseline::Top).draw(display);
+    }
+}
+
+fn render_visualizer<D>(display: &mut D, bands: &[u8; 8])
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    // Eight bars laid out left-of-the-volume-bar. 13 wide + 1 px gap × 8 =
+    // 111 px, starts at x=2, ends at x=112 — leaves a 5 px gutter before the
+    // volume outline at x=118.
+    const BAR_W: u32 = 13;
+    const GAP: i32 = 1;
+    const LEFT: i32 = 2;
+    const BOTTOM: i32 = 63;
+    const MAX_H: i32 = 60;
+    for (i, &v) in bands.iter().enumerate() {
+        let h = (v as i32 * MAX_H) / 255;
+        if h <= 0 {
+            continue;
+        }
+        let x = LEFT + i as i32 * (BAR_W as i32 + GAP);
+        let y = BOTTOM - h + 1;
+        let _ = Rectangle::new(Point::new(x, y), Size::new(BAR_W, h as u32))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display);
     }
 }
 
@@ -471,15 +499,19 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
     // SK6812MINI-E render the same RGB code differently — SK6812 has a
     // stronger green bias and looks yellow at the same G:R ratio, so we tune
     // the constants by eye against the project accent `#CF6A4C` (warm orange).
-    const ACCENT_UNDERGLOW: RGB8 = RGB8 { r: 112, g: 32, b: 0 };
+    const ACCENT_UNDERGLOW: RGB8 = RGB8 {
+        r: 112,
+        g: 32,
+        b: 0,
+    };
     const ACCENT_PERKEY: RGB8 = RGB8 { r: 96, g: 12, b: 0 };
     const PRESS_DECAY: u8 = 18;
     const TICK_MS: u64 = 16; // ~60 Hz idle/press render
-    // Volume gauge: when the host pushes a Volume frame, fill the underglow
-    // ring proportionally to `level / 100`. Held at full intensity for
-    // VOL_GAUGE_HOLD_MS, then fades to black across VOL_GAUGE_FADE_MS so the
-    // ring returns to the idle dark state. Sub-LED precision (1 LED = 256
-    // units) keeps the leading edge smooth at 1 % volume increments.
+                             // Volume gauge: when the host pushes a Volume frame, fill the underglow
+                             // ring proportionally to `level / 100`. Held at full intensity for
+                             // VOL_GAUGE_HOLD_MS, then fades to black across VOL_GAUGE_FADE_MS so the
+                             // ring returns to the idle dark state. Sub-LED precision (1 LED = 256
+                             // units) keeps the leading edge smooth at 1 % volume increments.
     const VOL_GAUGE_HOLD_MS: u32 = 1500;
     const VOL_GAUGE_FADE_MS: u32 = 700;
     const VOL_GAUGE_TOTAL_MS: u64 = (VOL_GAUGE_HOLD_MS + VOL_GAUGE_FADE_MS) as u64;
@@ -537,12 +569,19 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
             }
         }
 
+        // Snapshot viz state once per tick — direct read avoids saturating
+        // `LED_EVENTS` at 60 Hz host frame rate.
+        let (viz_active, viz_bands) = DISPLAY_STATE.lock(|s| {
+            let s = s.borrow();
+            (s.visualizer_active(), s.bands)
+        });
+
         for i in 0..PER_KEY_END {
-            let b = press_brightness[i] as u16;
+            let press = press_brightness[i] as u16;
             frame[i] = RGB8 {
-                r: ((ACCENT_PERKEY.r as u16 * b) / 255) as u8,
-                g: ((ACCENT_PERKEY.g as u16 * b) / 255) as u8,
-                b: ((ACCENT_PERKEY.b as u16 * b) / 255) as u8,
+                r: ((ACCENT_PERKEY.r as u16 * press) / 255) as u8,
+                g: ((ACCENT_PERKEY.g as u16 * press) / 255) as u8,
+                b: ((ACCENT_PERKEY.b as u16 * press) / 255) as u8,
             };
             press_brightness[i] = press_brightness[i].saturating_sub(PRESS_DECAY);
         }
@@ -558,8 +597,8 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
                     g: ((MUTE_COLOR.g as u32 * envelope) / 255) as u8,
                     b: ((MUTE_COLOR.b as u32 * envelope) / 255) as u8,
                 };
-                for i in UNDERGLOW_START..NUM_LEDS {
-                    frame[i] = color;
+                for px in &mut frame[UNDERGLOW_START..NUM_LEDS] {
+                    *px = color;
                 }
             }
             Some(UnderglowEffect::Gauge(start))
@@ -607,8 +646,38 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
             }
             _ => {
                 effect = None;
-                for i in UNDERGLOW_START..NUM_LEDS {
-                    frame[i] = RGB8::default();
+                if viz_active {
+                    // Spectrum mirrored around the front-of-device LED (chain
+                    // index 13 ≈ 6 o'clock, the side closest to the user). Bass
+                    // pulses at the centre and treble walks both ways toward
+                    // the back of the ring, so a kick lands in front of you
+                    // instead of dragging across the whole strip.
+                    const CENTER_OFFSET: i32 = SPIRAL_PIVOT as i32 - UNDERGLOW_START as i32;
+                    const HALF: i32 = (UNDERGLOW_COUNT as i32) / 2;
+                    const COUNT_I32: i32 = UNDERGLOW_COUNT as i32;
+                    for i in 0..UNDERGLOW_COUNT {
+                        let raw = (i as i32 - CENTER_OFFSET).rem_euclid(COUNT_I32);
+                        let dist = raw.min(COUNT_I32 - raw); // 0..=HALF
+                                                             // Lerp between adjacent bands in 8.8 fixed point.
+                        let band_pos = (dist as u32 * 7 * 256) / HALF as u32;
+                        let bi = (band_pos / 256) as usize;
+                        let frac = band_pos % 256;
+                        let v0 = viz_bands[bi.min(7)] as u32;
+                        let v1 = viz_bands[(bi + 1).min(7)] as u32;
+                        let lin = (v0 * (256 - frac) + v1 * frac) / 256;
+                        // Square-law gamma so quiet noise stays dark and
+                        // beats stand out instead of glowing the whole ring.
+                        let factor = (lin * lin) / 255;
+                        frame[UNDERGLOW_START + i] = RGB8 {
+                            r: ((ACCENT_UNDERGLOW.r as u32 * factor) / 255) as u8,
+                            g: ((ACCENT_UNDERGLOW.g as u32 * factor) / 255) as u8,
+                            b: ((ACCENT_UNDERGLOW.b as u32 * factor) / 255) as u8,
+                        };
+                    }
+                } else {
+                    for px in &mut frame[UNDERGLOW_START..NUM_LEDS] {
+                        *px = RGB8::default();
+                    }
                 }
             }
         }
@@ -703,10 +772,22 @@ async fn matrix_task(matrix: [Input<'static>; 9]) {
                     let _ = LED_EVENTS.try_send(LedCommand::KeyPress { led });
                 }
                 // Encoder click (matrix [0,2]) also surfaces to the host so
-                // the daemon can do something custom with it (e.g. switch
-                // active MPRIS player) on top of the HID Mute it already sent.
+                // the daemon can hook custom actions on it (currently just
+                // logged) on top of the HID Mute it already sent.
                 if i == 2 {
                     let _ = DEVICE_TX_EVENTS.try_send(DeviceToHost::EncoderClick);
+                }
+                // matrix [1,2] = the key directly below the encoder. Bound
+                // locally to "toggle the underglow visualizer" — host stays
+                // unaware and keeps streaming bands; firmware just stops
+                // rendering them.
+                if i == 5 {
+                    let enabled = DISPLAY_STATE.lock(|s| {
+                        let mut s = s.borrow_mut();
+                        s.visualizer_enabled = !s.visualizer_enabled;
+                        s.visualizer_enabled
+                    });
+                    info!("visualizer toggled: enabled={}", enabled);
                 }
             }
         }

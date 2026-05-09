@@ -64,7 +64,6 @@ Dates next to GitHub URLs are not pinned; the linked branches are `main` /
 - RMK keyboard framework — <https://docs.rs/rmk> · site: <https://rmk.rs>
 - `defmt` — <https://defmt.ferrous-systems.com/> · `defmt-rtt` — <https://docs.rs/defmt-rtt>
 - `postcard` (binary serde) — <https://docs.rs/postcard>
-- `heapless` — <https://docs.rs/heapless>
 - `elf2uf2-rs` — <https://github.com/JoNil/elf2uf2-rs>
 
 ## USB HID Consumer Control reference
@@ -73,14 +72,12 @@ Dates next to GitHub URLs are not pinned; the linked branches are `main` /
 - "HID Multimedia Dial" walkthrough (descriptor + codes) — <https://hw-by-design.blogspot.com/2018/07/hid-multimedia-dial.html>
 - Custom USB HID descriptor: media + keyboard — <https://notes.iopush.net/blog/2016/custom-usb-hid-device-descriptor-media-keyboard/>
 
-## Host-side now-playing & volume
+## Host-side volume + visualizer
 
-- `souvlaki` (cross-platform media controls) — <https://docs.rs/souvlaki>
-- `mpris` (Linux MPRIS client) — <https://docs.rs/mpris>
-- `zbus` (async D-Bus, alternative MPRIS path) — <https://docs.rs/zbus>
-- `windows::Media::Control` (GSMTC) — <https://microsoft.github.io/windows-docs-rs/doc/windows/Media/Control/>
-- `gsmtc` (GSMTC wrapper) — <https://docs.rs/win-gsmtc>
-- `windows-volume-control` — <https://crates.io/crates/windows-volume-control>
 - `serialport` (cross-platform host serial) — <https://docs.rs/serialport>
-- MPRIS spec — <https://specifications.freedesktop.org/mpris-spec/latest/>
-- Raymond Chen on GSMTC — <https://devblogs.microsoft.com/oldnewthing/20231108-00/?p=108980>
+- `pipewire` (Rust bindings for libpipewire) — <https://docs.rs/pipewire>
+- PipeWire native API reference — <https://docs.pipewire.org/>
+- `realfft` (real-input FFT, half-spectrum output) — <https://docs.rs/realfft>
+- `arc-swap` (lock-free `Arc` swap; the latest-viz-frame slot) — <https://docs.rs/arc-swap>
+- `crossbeam-channel` — <https://docs.rs/crossbeam-channel>
+- `wpctl` (WirePlumber CLI used to read default-sink volume) — <https://pipewire.pages.freedesktop.org/wireplumber/daemon/wpctl.html>

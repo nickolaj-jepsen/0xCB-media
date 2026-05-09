@@ -1,8 +1,9 @@
 # System architecture
 
 How the firmware ended up structured, what the USB device looks like, and
-how data flows from host MPRIS to the OLED. This doc reflects the shipping
-v1 — for the planning-phase aspirations and dropped ideas, see
+how data flows from the host (PipeWire volume + FFT spectrum) to the OLED
+and the underglow LED ring. This doc reflects the shipping v1 — for the
+planning-phase aspirations and dropped ideas, see
 [`06-implementation-notes.md`](06-implementation-notes.md).
 
 ## Block view
@@ -59,8 +60,8 @@ v1 — for the planning-phase aspirations and dropped ideas, see
                                                ▼
                                        ┌──────────────┐
                                        │ Linux host   │
-                                       │ (mpris,      │
-                                       │  wpctl)      │
+                                       │ (wpctl,      │
+                                       │  pipewire-rs)│
                                        └──────────────┘
 ```
 
@@ -71,9 +72,9 @@ v1 — for the planning-phase aspirations and dropped ideas, see
 | `usb_task` | spawned | event-driven | Run the embassy-usb device loop. |
 | `hid_writer_task` | spawned | on event | Drain `CONSUMER_EVENTS`, emit press+release HID Consumer reports. |
 | `cdc_tx_task` | spawned | on event | Drain `DEVICE_TX_EVENTS`, COBS-encode + send `DeviceToHost` packets. |
-| `matrix_task` | spawned | 1 kHz tick | 5-tick integrator debounce on 9 inputs. On press: push HID + LED + (encoder-only) DEVICE_TX events. |
+| `matrix_task` | spawned | 1 kHz tick | 5-tick integrator debounce on 9 inputs. On press: push HID + LED + (encoder-only) DEVICE_TX events. Also flips `DISPLAY_STATE.visualizer_enabled` for matrix `[1,2]` (the key below the encoder). |
 | `encoder_task` | spawned | event-driven | GPIO-IRQ gray-code decode of GP11/GP10 → push `VolumeUp`/`VolumeDown` to `CONSUMER_EVENTS`. |
-| `led_task` | spawned | 60 Hz | Boot spiral → idle (per-key flashes from `LED_EVENTS`, underglow off). |
+| `led_task` | spawned | 60 Hz | Boot spiral → per-key flashes from `LED_EVENTS`. Underglow priority: `Mute` flash > `VolumeChanged` gauge > visualizer spectrum (mirrored around chain LED 13) > black. |
 | `display_loop` | inline (`main`, joined) | 30 Hz | Snapshot `DISPLAY_STATE`, render, `display.flush().await`. |
 | `cdc_rx_loop` | inline (`main`, joined) | event-driven | Read CDC packets, COBS-decode `HostToDevice`, mutate `DISPLAY_STATE`. |
 
@@ -162,7 +163,7 @@ Stable across Windows, macOS, Linux, ChromeOS, Android.
 | (0,2) | GP9  | Mute (encoder click) | (none — encoder) |
 | (1,0) | GP26 | Next Track | LED 2 |
 | (1,1) | GP28 | Stop | LED 3 |
-| (1,2) | GP8  | (unbound) | LED 4 |
+| (1,2) | GP8  | Toggle visualizer (firmware-local; no HID) | LED 4 |
 | (2,0) | GP18 | (unbound) | LED 7 |
 | (2,1) | GP17 | (unbound) | LED 6 |
 | (2,2) | GP12 | (unbound) | LED 5 |
@@ -175,28 +176,55 @@ for 9 inputs).
 
 ## OLED layout (128 × 64, FONT_6X10)
 
+While audio is flowing on the host's default sink, the left pane shows an
+8-band FFT spectrum streamed from the daemon. The right edge is always a
+vertical volume bar; left pane is blank when the visualizer isn't active
+(no audio for >500 ms, or the user has toggled it off).
+
 ```
 ┌────────────────────────────────────────────────────────────┐ y=0
-│ > Bohemian Rhapsody                                        │
-│   Queen                                                    │
-│                                                            │
-│ ┌────────────────────────────────────────────────┐ 47%     │
-│ │████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░│         │
-│ └────────────────────────────────────────────────┘         │
+│  ▌ █ ▆ ▆ ▃ ▂ ▁ ▁                                       ┌─┐│
+│  ▆ █ █ ▆ ▅ ▄ ▃ ▂                                       │█││
+│  █ █ █ █ ▅ ▄ ▃ ▂                                       │█││ ← volume bar
+│  █ █ █ █ █ ▅ ▄ ▃                                       │█││   (8 wide,
+│  █ █ █ █ █ ▆ ▄ ▃                                       │ ││    fills bottom-up)
+│  █ █ █ █ █ █ ▅ ▄                                       │ ││
+│  ───spectrum (8 bars × 13 wide × 60 tall)──            └─┘│
 └────────────────────────────────────────────────────────────┘ y=63
 ```
 
-- **Status glyph** top-left: `>` (playing) / `||` (paused) / `-` (no track).
-  ASCII because FONT_6X10 doesn't have unicode play/pause/stop glyphs.
-- **Title** row 1, **artist** row 2 — both truncate at the right edge
-  (no scrolling in v1).
-- **Volume bar** is a 102×9 rectangle outline with a 0..100 px filled
-  inner. `MUTE` text replaces the bar when `muted = true`.
-- "Disconnected" UI fills the centre of the panel when no host frame has
-  arrived in the last 5 s.
+- **Spectrum bars**: 8 bars at `BAR_W=13`, `GAP=1`, `LEFT=2`, anchored to
+  the bottom (`BOTTOM=63`, `MAX_H=60`). Heights are linear in band value
+  (0..=255 → 0..60 px).
+- **Volume bar**: `Rectangle` outline at `(118, 2)` size `8 × 60`, inner
+  fill `Rectangle` at `(119, 3 + (58 - h))` size `6 × h` where
+  `h = level * 58 / 100`. Mute = solid stripe at `(118, 30)` size `8 × 4`
+  across the middle.
+- **Z-order**: spectrum bars are drawn first, the volume bar last, so a
+  tall spectrum bar can never bleed into the volume column.
+- **Disconnected UI**: `"Disconnected"` + `"(no host daemon)"` centred,
+  no volume bar, when no host frame has arrived in the last 5 s.
 
 `embedded-graphics` + `BufferedGraphicsMode` makes the whole render
 ~50 LOC.
+
+## Underglow visualizer (LEDs 8..30)
+
+When the visualizer is active and no `Mute` or `VolumeChanged` effect is
+running, the underglow ring renders the same 8-band spectrum as the OLED.
+The mapping is **mirrored around chain LED 13** (the `SPIRAL_PIVOT`,
+~6 o'clock — the side of the device closest to the user):
+
+- `dist = min(|i - CENTER_OFFSET| mod 23, 23 - that)` for `i in 0..23`,
+  giving `0..=11` (half the ring).
+- `band = lerp(bands[bi], bands[bi+1], frac)` where
+  `band_pos = dist * 7 / 11`.
+- A **square-law gamma** (`value² / 255`) keeps quiet noise dark and lets
+  beats stand out — without this the whole ring glows faintly.
+
+So a kick drum lands at the front of the pad and rolls outward to both
+sides; treble hits show up at the back. `ACCENT_UNDERGLOW = (112, 32, 0)`
+sets the colour (warm orange `#CF6A4C` after the WS2812B colour bias).
 
 ## Boot sequence
 
@@ -222,7 +250,8 @@ for 9 inputs).
 | Encoder reads doubled detents / random direction | Contact bounce. The gray-code state machine + 150 µs settle handles this; if it regresses, raise the settle time. |
 | Volume keys do nothing on host | Wrong report ID, or HID descriptor doesn't match what we're writing. `lsusb -v -d cb00:1337` should show `Usage Page (Consumer)` in the parsed descriptor. |
 | Keyboard sends a continuous stream of one media key | Forgot the release report after the press. |
-| Daemon's `NowPlaying` never appears on OLED | Another process (picocom, screen) is holding the CDC port; daemon's open will fail or its writes will go elsewhere. |
+| OLED stays blank while music is playing | Visualizer is toggled off (press the key below the encoder), or the daemon's viz thread can't reach PipeWire (`RUST_LOG=debug` will show `viz capturing` once the format negotiates), or another process (picocom, screen) is holding the CDC port. |
+| Volume bar doesn't move | Daemon's `volume` thread never read a successful `wpctl get-volume` — check that PipeWire/WirePlumber is up. |
 | OLED says "Disconnected" while daemon is running | Daemon is talking to the wrong device, or the firmware-side CDC RX loop got starved. Run with `RUST_LOG=debug` and confirm `serial connected` and per-message logs. |
 
 ## Resolved planning-phase questions

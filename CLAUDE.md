@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Cargo workspace with three crates targeting two architectures:
 
 - `firmware/` — `no_std`, Embassy-on-RP2040, target `thumbv6m-none-eabi`. Composite USB device (HID Consumer Control + CDC ACM). Runs on a 0xCB-1337 rev5.0 macropad.
-- `host/` — Linux-only daemon binary (`0xcb-media-host`) plus a manual test sender (`0xcb-media-test-send`). Bridges MPRIS now-playing + `wpctl` volume to the macropad over CDC ACM.
+- `host/` — Linux-only daemon binary (`0xcb-media-host`) plus a manual test sender (`0xcb-media-test-send`). Streams `wpctl` volume + an FFT audio visualizer to the macropad over CDC ACM.
 - `proto/` — `no_std`-friendly serde schema (`HostToDevice`, `DeviceToHost`) shared between the two. Wire format: postcard + COBS framing, one frame per `0x00` delimiter, `MAX_FRAME_LEN = 256`.
 
 `Cargo.toml` sets `default-members = ["proto", "host"]` so workspace-wide commands skip the firmware (which can't cross-compile without its own target config).
@@ -73,21 +73,20 @@ Bootmagic (hold encoder click while plugging in → ROM bootloader) is **firmwar
 - **SK6812MINI-E (per-key, indices 0–7) vs WS2812B (underglow, 8–30) render colour differently** despite shared timing/byte-order. Two tuned constants (`ACCENT_PERKEY`, `ACCENT_UNDERGLOW`) hit the same visible accent (`#CF6A4C`).
 - **embassy-usb 0.6 API quirks**: `HidSubclass::No` (not `NoSubclass`/`None`), `HidBootProtocol::None` (not `Default`), `PioWs2812` takes a 4th type parameter `ORDER` (`Grb`).
 - **embassy 0.10 spawn API**: tasks return `Result<SpawnToken, SpawnError>`; pattern is `spawner.spawn(my_task(args).unwrap())`. The arch feature is `platform-cortex-m`, not `arch-cortex-m`.
-- **heapless 0.8**: no const `TryFrom<&str>`. Build via `push_str` (or per-char in a loop for explicit truncation, as `heapless_truncate` does in the host crate).
 
 `docs/06-implementation-notes.md` has the long form of all of these.
 
 ## Wire protocol invariants (proto crate)
 
-`HostToDevice::NowPlaying { title: String<64>, artist: String<32>, is_playing }`, `Volume { level: u8 (0..=100), muted }`, `Clear`, `Ping`. `DeviceToHost::Pong`, `EncoderClick`. Frames are postcard-COBS; both sides decode by buffering until `0x00` and calling `postcard::from_bytes_cobs`. If you change capacities or add variants, also bump `MAX_FRAME_LEN` in `proto/src/lib.rs` and check `tx_buf` / `frame_buf` sizes on both sides.
+`HostToDevice::Volume { level: u8 (0..=100), muted }`, `Ping`, `Visualizer { bands: [u8; 8] }`. `DeviceToHost::Pong`, `EncoderClick`. Frames are postcard-COBS; both sides decode by buffering until `0x00` and calling `postcard::from_bytes_cobs`. If you change capacities or add variants, also bump `MAX_FRAME_LEN` in `proto/src/lib.rs` and check `tx_buf` / `frame_buf` sizes on both sides.
 
-The firmware flips its OLED to "Disconnected" after 5 s without any host frame. The daemon's ping thread defaults to 2 s — keep `ping_interval_s ≤ 4` if you change defaults.
+The firmware flips its OLED to "Disconnected" after 5 s without any host frame. The daemon's ping thread defaults to 2 s — keep `ping_interval_s ≤ 4` if you change defaults. Visualizer frames are also gated by a 500 ms freshness window: stop sending and the OLED bars fade off.
 
 ## Host daemon
 
-`host/src/bin/0xcb-media-host.rs` — three blocking source threads (`mpris`, `volume`, `ping`) feed a bounded `crossbeam_channel` of `HostToDevice`; a single serial loop drains the channel, COBS-encodes, and writes. The same loop also reads `DeviceToHost` frames (currently logs `EncoderClick`). Reopens the port with 2 s backoff on any I/O error.
+`host/src/bin/0xcb-media-host.rs` — two blocking source threads (`volume`, `ping`) plus an FFT viz thread feed the device. Volume/ping push into a bounded `crossbeam_channel` of `HostToDevice`; the viz thread stores its latest 8-band frame into a lock-free `ArcSwapOption` slot. A single serial loop drains both, COBS-encodes, and writes. The same loop also reads `DeviceToHost` frames (currently logs `EncoderClick`). Reopens the port with 2 s backoff on any I/O error.
 
-Volume comes from shelling out to `wpctl get-volume @DEFAULT_AUDIO_SINK@` and parsing `Volume: 0.47 [MUTED]?`. The daemon depends on PipeWire/WirePlumber being installed on the host. MPRIS comes from D-Bus via the `mpris` crate.
+Volume comes from shelling out to `wpctl get-volume @DEFAULT_AUDIO_SINK@` and parsing `Volume: 0.47 [MUTED]?`. The daemon depends on PipeWire/WirePlumber being installed on the host. The visualizer captures the default sink monitor via `pipewire`/`libspa`, runs a windowed real-FFT (`realfft`), and bins to 8 log-spaced dB-scaled bands.
 
 `OXCB_MEDIA_SERIAL` env var sets the device path (NixOS module wires this).
 

@@ -26,7 +26,9 @@ nix develop
 ```
 
 The shell pulls in `rustup`, `probe-rs`, `elf2uf2-rs`, plus `pkg-config`,
-`udev`, `dbus`, and `systemd` for the host crate's link-time deps.
+`udev`, `dbus`, `systemd`, `pipewire`, and `clang`/`libclang` for the host
+crate's link-time deps (the visualizer uses `pipewire-rs`, which uses
+bindgen).
 
 > If you build the **firmware** crate, you need to either `cd firmware/` first
 > (so its `.cargo/config.toml` sets `target = "thumbv6m-none-eabi"`), or pass
@@ -198,16 +200,13 @@ JSON because:
 
 ```toml
 postcard = { version = "1", default-features = false }
-heapless = { version = "0.8", features = ["serde"] }
 ```
 
-⚠️ heapless 0.8 `String::push_str` returns `Result<(), ()>` (no const
-`TryFrom<&str>`). To build a `String<N>` from a `&str` on the host side:
-
-```rust
-let mut s: heapless::String<N> = heapless::String::new();
-s.push_str(text).map_err(|_| anyhow!("string too long"))?;
-```
+The schema is plain enums + fixed-size primitives (`[u8; 8]`, `u8`, `bool`)
+so the proto crate doesn't even need `heapless`. An earlier iteration
+shipped a `NowPlaying { title: String<64>, artist: String<32>, … }`
+variant; that's gone — see [`04-host-integration.md`](04-host-integration.md)
+for the current variants.
 
 ## Memory layout
 
@@ -245,7 +244,7 @@ What actually got built (single workspace, three members):
 └── host/                          # std, runs on Linux PC
     ├── Cargo.toml
     └── src/bin/
-        ├── 0xcb-media-host.rs     # MPRIS / wpctl daemon
+        ├── 0xcb-media-host.rs     # wpctl + PipeWire FFT daemon
         └── 0xcb-media-test-send.rs # one-shot frame tester
 ```
 

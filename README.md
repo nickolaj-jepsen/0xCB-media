@@ -12,9 +12,12 @@ The macropad becomes:
 - **A USB media remote** — buttons send `Play/Pause`, `Next`, `Previous`, `Mute`
   via USB HID Consumer Control reports.
 - **A volume knob** — the EC11 rotary encoder maps to `Volume Up`/`Volume Down`
-  consumer reports, with the click pre-bound (e.g. `Mute` or `Play/Pause`).
-- **A now-playing display** — the onboard 128×64 SSD1306 OLED shows the
-  current track title, artist, and a live volume bar pushed from the host.
+  consumer reports, with the click pre-bound to `Mute`.
+- **An audio visualizer + volume display** — the onboard 128×64 SSD1306 OLED
+  shows an 8-band FFT spectrum of whatever's playing on the host's default
+  PipeWire sink, alongside a vertical volume bar. The 23-LED underglow ring
+  pulses with the same spectrum. Toggle the visualizer on/off with the key
+  below the encoder.
 
 The firmware is written in Rust on top of [Embassy](https://embassy.dev/) for the
 RP2040, and is flashed/debugged with [probe.rs](https://probe.rs).
@@ -55,16 +58,17 @@ Pinout, BOM, and bootloader entry are documented in
 │         PC host         │ ─── HID Consumer ────▶    │       0xCB-1337          │
 │                         │ ─── CDC ACM      ◀──▶     │   (RP2040, Embassy)      │
 │  ┌───────────────────┐  │   (postcard+COBS:         │                          │
-│  │ 0xcb-media-host   │  │    NowPlaying, Volume,    │   ┌──────────────────┐   │
-│  │   ├── mpris       │  │    Ping → device          │   │  USB HID Consumer│   │
-│  │   ├── wpctl poll  │  │    EncoderClick ← device) │   │  Play/Pause, Mute│   │
+│  │ 0xcb-media-host   │  │    Volume, Visualizer,    │   ┌──────────────────┐   │
+│  │   ├── volume      │  │    Ping → device          │   │  USB HID Consumer│   │
+│  │   ├── pw-viz (FFT)│  │    EncoderClick ← device) │   │  Play/Pause, Mute│   │
 │  │   └── ping        │  │                           │   │  Vol Up/Down ... │   │
 │  └───────────────────┘  │                           │   └──────────────────┘   │
 └─────────────────────────┘                           │   ┌──────────────────┐   │
                                                       │   │ SSD1306 OLED     │   │
-                                                      │   │ ▶ Track — Artist │   │
-                                                      │   │ [████████  ] 73% │   │
+                                                      │   │ █ ▌ █ ▆ ▆ ▃ ▂ ▁║│   │
+                                                      │   │ █ █ █ █ ▅ ▄ ▃ ▂║│   │
                                                       │   └──────────────────┘   │
+                                                      │   31-LED ring: spectrum  │
                                                       └──────────────────────────┘
 ```
 
@@ -72,11 +76,13 @@ Three crates:
 
 1. **`firmware/`** — Rust no-std crate flashed to the RP2040. Composite USB
    device exposing HID Consumer Control (media keys + volume) and CDC ACM
-   (for now-playing data). Drives the OLED, encoder, key matrix, and RGB.
-2. **`host/`** — Linux daemon (`0xcb-media-host`) that bridges MPRIS
-   now-playing data and PipeWire/WirePlumber volume to the macropad over CDC
-   ACM. Watches `DeviceToHost::EncoderClick` from the firmware for custom
-   actions (currently logged; future: switch active MPRIS player).
+   (for the volume + visualizer feed). Drives the OLED, encoder, key matrix,
+   and the 31-LED RGB chain.
+2. **`host/`** — Linux daemon (`0xcb-media-host`) that streams the current
+   PipeWire/WirePlumber default-sink volume and an 8-band FFT spectrum of
+   the audio coming out of that sink to the macropad over CDC ACM. Watches
+   `DeviceToHost::EncoderClick` from the firmware for custom actions
+   (currently just logged).
 3. **`proto/`** — Shared `no_std`-friendly serde schema for the wire format
    (postcard + COBS framing).
 
@@ -96,7 +102,7 @@ backends would need to be added.
 | [`docs/01-hardware.md`](docs/01-hardware.md) | 0xCB-1337 rev5.0 hardware: BOM, pinout, bootloader entry, schematic links |
 | [`docs/02-firmware-stack.md`](docs/02-firmware-stack.md) | Rust toolchain, embassy-rp / embassy-usb / ssd1306 versions actually used, atomic CAS gotcha, crate skeleton |
 | [`docs/03-probe-rs.md`](docs/03-probe-rs.md) | probe.rs install, debug probe options, RP2040 flashing & RTT logging (optional — UF2 was sufficient for v1) |
-| [`docs/04-host-integration.md`](docs/04-host-integration.md) | MPRIS + wpctl daemon design, wire schema, NixOS module deployment |
+| [`docs/04-host-integration.md`](docs/04-host-integration.md) | wpctl + PipeWire FFT daemon design, wire schema, NixOS module deployment |
 | [`docs/05-architecture.md`](docs/05-architecture.md) | Final firmware task layout, USB descriptors, OLED layout, boot sequence |
 | [`docs/06-implementation-notes.md`](docs/06-implementation-notes.md) | Surprises and gotchas from the actual build — bootmagic-is-firmware, PIO encoder hang, SK6812 vs WS2812B colour, embassy 0.10 API quirks |
 | [`docs/sources.md`](docs/sources.md) | Every URL referenced in the docs |
@@ -146,9 +152,12 @@ Useful flags:
 # Verbose logging
 RUST_LOG=debug cargo run --release -p host --bin 0xcb-media-host
 
-# Pin to a specific MPRIS player (find names via: `busctl --user list | grep mpris`)
+# Disable the visualizer entirely (no PipeWire capture, no FFT thread)
+cargo run --release -p host --bin 0xcb-media-host -- --no-visualizer
+
+# Pin the visualizer to a specific PipeWire node (e.g. a non-default sink monitor)
 cargo run --release -p host --bin 0xcb-media-host -- \
-  --mpris-player org.mpris.MediaPlayer2.spotify
+  --visualizer-source alsa_output.pci-0000_00_1b.0.analog-stereo.monitor
 
 # Custom serial path (defaults to /dev/ttyACM0 or $OXCB_MEDIA_SERIAL)
 cargo run --release -p host --bin 0xcb-media-host -- --device /dev/ttyACM1
@@ -184,27 +193,35 @@ After `nixos-rebuild switch`:
 systemctl --user status 0xcb-media-host
 ```
 
-### Testing the OLED data path without the daemon
+### Testing the device without the daemon
 
-There's a helper binary that pushes one hardcoded `NowPlaying` + `Volume`
-frame at the device:
+There's a helper binary that can push one `Volume` frame or stream a
+synthetic visualizer pattern, useful when you want to validate the firmware
+without PipeWire in the loop:
 
 ```fish
-cargo run --release -p host --bin 0xcb-media-test-send -- /dev/ttyACM0 "Money" "Pink Floyd" 73
+# Send Volume(73%)
+cargo run --release -p host --bin 0xcb-media-test-send -- /dev/ttyACM0 73
+
+# ~6 s of swept-band synthetic spectrum
+cargo run --release -p host --bin 0xcb-media-test-send -- /dev/ttyACM0 --viz
 ```
 
 ## Default keymap
 
 ```
-                col 0          col 1          col 2 (encoder click)
-row 0   ┌──────────────────────────────────────────────────────────┐
-        │  Prev Track  │  Play/Pause  │       Mute                │
-row 1   │  Next Track  │  Stop        │       (unbound)           │
-row 2   │  (unbound)   │  (unbound)   │       (unbound)           │
-        └──────────────────────────────────────────────────────────┘
+                col 0          col 1          col 2 (encoder click on row 0)
+row 0   ┌────────────────────────────────────────────────────────────┐
+        │  Prev Track  │  Play/Pause  │       Mute                  │
+row 1   │  Next Track  │  Stop        │       Toggle visualizer     │
+row 2   │  (unbound)   │  (unbound)   │       (unbound)             │
+        └────────────────────────────────────────────────────────────┘
 ```
 
-Encoder rotation: CW = Volume Up, CCW = Volume Down. Edit `KEYMAP` in
+Encoder rotation: CW = Volume Up, CCW = Volume Down. The "Toggle visualizer"
+key (matrix `[1,2]`, the one directly below the encoder) is firmware-only —
+it flips a flag in `DISPLAY_STATE`, so the host stays unaware and keeps
+streaming. Edit `KEYMAP` in
 [`firmware/src/main.rs`](firmware/src/main.rs) to remap; takes a re-flash.
 
 ## License

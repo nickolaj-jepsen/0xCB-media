@@ -8,4 +8,3 @@ description = "Shared wire-protocol types between 0xCB-media firmware and host."
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", default-features = false }
-heapless = { version = "0.8", features = ["serde"] }

@@ -132,26 +132,6 @@ walks up from CWD looking for `.cargo/config.toml`, so:
 For the host crate the inverse holds: build from anywhere, but you need
 the flake's devShell so `pkg-config` can find `libudev` / `dbus`.
 
-## heapless 0.8 String construction
-
-`heapless::String<N>` doesn't have a const `TryFrom<&str>` in 0.8. Build
-strings via `push_str`:
-
-```rust
-let mut s: heapless::String<N> = heapless::String::new();
-s.push_str(text).map_err(|_| anyhow!("string too long"))?;
-```
-
-Truncation at capacity (when copying possibly-too-long external strings)
-needs to be explicit:
-
-```rust
-let mut out = heapless::String::<N>::new();
-for c in s.chars() {
-    if out.push(c).is_err() { break; }
-}
-```
-
 ## Cargo bin auto-detection vs `[[bin]]`
 
 If `src/main.rs` exists AND `[[bin]] path = "src/main.rs"` is declared,
@@ -177,7 +157,8 @@ per task.
 
 ## Tested only on Linux
 
-The host daemon is Linux-specific (uses MPRIS via D-Bus + `wpctl`
-shell-out). The proto crate is OS-agnostic so adding a Windows backend
-(via `gsmtc`) or a macOS backend should be a contained module addition,
-but neither is in v1.
+The host daemon is Linux-specific: it uses `wpctl` for the volume scalar
+and `pipewire-rs` to capture float samples from the default-sink monitor
+for the FFT visualizer. The proto crate is OS-agnostic so adding a Windows
+backend (WASAPI loopback) or a macOS backend should be a contained module
+addition, but neither is in v1.

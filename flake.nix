@@ -48,11 +48,17 @@
             cargoBuildFlags = [ "-p" "host" ];
             cargoTestFlags  = [ "-p" "host" ];
 
-            nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs       = [ pkgs.udev pkgs.dbus ];
+            # `pipewire-sys` runs bindgen against the libpipewire / libspa
+            # headers, so we need clang at build time. `LIBCLANG_PATH` and
+            # `BINDGEN_EXTRA_CLANG_ARGS` are wired up below.
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.clang ];
+            buildInputs       = [ pkgs.udev pkgs.dbus pkgs.pipewire ];
+
+            LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include -I${pkgs.pipewire.dev}/include/pipewire-0.3 -I${pkgs.pipewire.dev}/include/spa-0.2";
 
             meta = {
-              description = "0xCB-media Linux daemon: bridges MPRIS now-playing data to the macropad over USB CDC ACM.";
+              description = "0xCB-media Linux daemon: streams PipeWire volume + an audio visualizer to the macropad over USB CDC ACM.";
               license     = pkgs.lib.licenses.gpl2Plus;
               mainProgram  = "0xcb-media-host";
               platforms   = pkgs.lib.platforms.linux;
@@ -118,8 +124,12 @@
               # Host-side build deps
               pkg-config
               udev          # libudev for serialport / probe-rs
-              dbus          # for the mpris crate
+              dbus          # libdbus — pipewire pulls it in transitively
               systemd       # systemd headers for the user unit + libudev
+              pipewire      # libpipewire-0.3 for the audio visualizer
+              # pipewire-sys uses bindgen — libclang must be discoverable.
+              clang
+              libclang.lib
 
               # Convenience
               cargo-binutils
@@ -128,7 +138,8 @@
 
             # Make `cargo` see system libraries
             shellHook = ''
-              export PKG_CONFIG_PATH="${pkgs.udev.dev}/lib/pkgconfig:${pkgs.dbus.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
+              export PKG_CONFIG_PATH="${pkgs.udev.dev}/lib/pkgconfig:${pkgs.dbus.dev}/lib/pkgconfig:${pkgs.pipewire.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
+              export LIBCLANG_PATH="${pkgs.libclang.lib}/lib"
               echo "0xCB-media devShell ready."
               echo "  rustup show          → toolchain info"
               echo "  cargo run -p firmware → flash via probe-rs"
@@ -143,7 +154,7 @@
             cfg = config.services."0xcb-media-host";
           in {
             options.services."0xcb-media-host" = {
-              enable = lib.mkEnableOption "0xCB-media host daemon (per-user systemd unit bridging MPRIS to the macropad)";
+              enable = lib.mkEnableOption "0xCB-media host daemon (per-user systemd unit streaming volume + visualizer to the macropad)";
 
               package = lib.mkOption {
                 type        = lib.types.package;
@@ -179,7 +190,7 @@
             # (or install a udev rule that chmods the device.)
             config = lib.mkIf cfg.enable {
               systemd.user.services."0xcb-media-host" = {
-                description = "0xCB-media host daemon (MPRIS → macropad)";
+                description = "0xCB-media host daemon (volume + visualizer → macropad)";
                 wantedBy    = [ "default.target" ];
                 after       = [ "graphical-session.target" ];
                 partOf      = [ "graphical-session.target" ];
