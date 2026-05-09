@@ -197,11 +197,13 @@ fn cycle<T: Copy + Eq>(all: &[T], current: T, step: i32) -> T {
 /// On-device menu navigation state. `Closed` = no menu, `Main` = top-level
 /// list of selectors, `Sub` = a selector's submenu where the encoder cycles
 /// the live value with no separate "draft" — current value *is* the selection.
+/// `Confirm` = bootloader reboot confirmation screen (OK to proceed, back to cancel).
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum MenuView {
     Closed,
     Main,
     Sub(Selector),
+    Confirm,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -368,6 +370,7 @@ pub fn apply_encoder_step(step: i8) -> bool {
                 };
                 true
             }
+            MenuView::Confirm => true,
         }
     })
 }

@@ -136,13 +136,17 @@ pub async fn matrix_task(matrix: [Input<'static>; 9], flash: &'static SharedFlas
                                     s.menu = MenuView::Sub(Selector::HueMode);
                                     false
                                 }
-                                3 => true,
+                                3 => {
+                                    s.menu = MenuView::Confirm;
+                                    false
+                                }
                                 _ => false,
                             },
                             MenuView::Sub(_) => {
                                 s.menu = MenuView::Main;
                                 false
                             }
+                            MenuView::Confirm => true,
                         };
                         (was_in_sub, bootloader)
                     });
@@ -168,7 +172,7 @@ pub async fn matrix_task(matrix: [Input<'static>; 9], flash: &'static SharedFlas
                         let mut s = s.borrow_mut();
                         let was_in_sub = matches!(s.menu, MenuView::Sub(_));
                         s.menu = match s.menu {
-                            MenuView::Sub(_) => MenuView::Main,
+                            MenuView::Sub(_) | MenuView::Confirm => MenuView::Main,
                             _ => MenuView::Closed,
                         };
                         was_in_sub

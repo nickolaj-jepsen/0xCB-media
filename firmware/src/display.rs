@@ -12,6 +12,25 @@ use embedded_graphics::{
 
 use crate::state::{DisplayState, GlowViz, HueMode, MenuView, OledViz, Selector, DISPLAY_STATE};
 
+// ─── Confirm ─────────────────────────────────────────────────────────────────
+
+fn render_confirm<D>(display: &mut D, text_style: &MonoTextStyle<'_, BinaryColor>)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    // FONT_6X10: 6 px/char wide, 10 px tall. Display = 128×64.
+    // "Reboot to"  = 9 ch → x=37; "bootloader?" = 11 ch → x=31
+    // "OK=confirm" = 10 ch → x=34; "back=cancel" = 11 ch → x=31
+    let _ = Text::with_baseline("Reboot to", Point::new(37, 8), *text_style, Baseline::Top)
+        .draw(display);
+    let _ = Text::with_baseline("bootloader?", Point::new(31, 20), *text_style, Baseline::Top)
+        .draw(display);
+    let _ = Text::with_baseline("OK=confirm", Point::new(34, 40), *text_style, Baseline::Top)
+        .draw(display);
+    let _ = Text::with_baseline("back=cancel", Point::new(31, 52), *text_style, Baseline::Top)
+        .draw(display);
+}
+
 /// Width of the time-history pane shared by waterfall + particles. The viz
 /// pane spans x=2..=112 — 110 px before the volume bar at x=118.
 const VIZ_W: usize = 110;
@@ -428,6 +447,7 @@ fn render_menu<D>(
         MenuView::Closed => {} // shouldn't reach here — render_frame guards
         MenuView::Main => render_main_menu(display, text_style, snapshot),
         MenuView::Sub(sel) => render_submenu(display, text_style, sel, snapshot),
+        MenuView::Confirm => render_confirm(display, text_style),
     }
 }
 
