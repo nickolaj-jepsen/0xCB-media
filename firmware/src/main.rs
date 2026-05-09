@@ -8,8 +8,8 @@
 //!
 //! `DISPLAY_STATE` is the shared state: CDC RX writes, the display loop and
 //! the LED task read, and the matrix / encoder tasks drive the on-device
-//! settings menu (visualizer + audio-RGB toggles) when the user opens it
-//! with the key below the encoder.
+//! settings menu (oled-viz + glow-viz selectors, plus a Bootloader action)
+//! when the user opens it with the key below the encoder.
 //!
 //! The display loop and `cdc_rx_loop` run inside `main` via
 //! `embassy_futures::join` rather than as spawned tasks because the OLED
@@ -150,8 +150,113 @@ struct VolumeInfo {
     muted: bool,
 }
 
-/// Number of items in the on-device settings menu. Used to wrap encoder
-/// rotation when the menu is open.
+/// OLED visualizer style. To add a new style: add a variant, list it in `ALL`,
+/// label it in `label()` / `long_label()`, and add a render arm in
+/// `render_frame`.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum OledViz {
+    Bars,
+    Mirror,
+    Dots,
+    Off,
+}
+
+impl OledViz {
+    const ALL: &'static [Self] = &[Self::Bars, Self::Mirror, Self::Dots, Self::Off];
+
+    /// Short label (≤4 chars) for the right column of the main menu.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bars => "bars",
+            Self::Mirror => "mirr",
+            Self::Dots => "dots",
+            Self::Off => "off",
+        }
+    }
+
+    /// Full label for the submenu list (room for longer text there).
+    fn long_label(self) -> &'static str {
+        match self {
+            Self::Bars => "bars",
+            Self::Mirror => "mirror",
+            Self::Dots => "dots",
+            Self::Off => "off",
+        }
+    }
+
+    fn next(self) -> Self {
+        cycle(Self::ALL, self, 1)
+    }
+    fn prev(self) -> Self {
+        cycle(Self::ALL, self, -1)
+    }
+}
+
+/// Underglow visualizer style. Same extension recipe as `OledViz`.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum GlowViz {
+    Spec,
+    Vu,
+    Bass,
+    Off,
+}
+
+impl GlowViz {
+    const ALL: &'static [Self] = &[Self::Spec, Self::Vu, Self::Bass, Self::Off];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Spec => "spec",
+            Self::Vu => "vu",
+            Self::Bass => "bass",
+            Self::Off => "off",
+        }
+    }
+
+    fn long_label(self) -> &'static str {
+        match self {
+            Self::Spec => "spectrum",
+            Self::Vu => "vu",
+            Self::Bass => "bass",
+            Self::Off => "off",
+        }
+    }
+
+    fn next(self) -> Self {
+        cycle(Self::ALL, self, 1)
+    }
+    fn prev(self) -> Self {
+        cycle(Self::ALL, self, -1)
+    }
+}
+
+/// Wrap-around step through a fixed slice of enum variants. Returns the first
+/// element if `current` isn't found (shouldn't happen for our enums).
+fn cycle<T: Copy + Eq>(all: &[T], current: T, step: i32) -> T {
+    let len = all.len() as i32;
+    let i = all.iter().position(|v| *v == current).unwrap_or(0) as i32;
+    let next = ((i + step).rem_euclid(len)) as usize;
+    all[next]
+}
+
+/// On-device menu navigation state. `Closed` = no menu, `Main` = top-level
+/// list of selectors, `Sub` = a selector's submenu where the encoder cycles
+/// the live value with no separate "draft" — current value *is* the selection.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum MenuView {
+    Closed,
+    Main,
+    Sub(Selector),
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum Selector {
+    OledViz,
+    GlowViz,
+}
+
+/// Number of rows in the main menu (oled viz, glow viz, Bootloader). Used to
+/// wrap encoder rotation when navigating the main menu.
 const MENU_ITEM_COUNT: u8 = 3;
 
 #[derive(Clone)]
@@ -164,18 +269,16 @@ struct DisplayState {
     /// they're considered fresh enough to render.
     bands: [u8; 8],
     last_visualizer: Instant,
-    /// Renders the FFT bars on the OLED when host audio is flowing. Toggled
-    /// from the on-device menu (item 0).
-    visualizer_enabled: bool,
-    /// Renders the audio-reactive spectrum on the underglow ring. Independent
-    /// of `visualizer_enabled`. Toggled from the on-device menu (item 1).
-    audio_rgb_enabled: bool,
-    /// True while the user is navigating the on-device settings menu. Drives
-    /// input routing in `matrix_task` / `encoder_task` and a full-screen
-    /// replacement in `render_frame`.
-    menu_open: bool,
-    /// Currently highlighted menu item, `0..MENU_ITEM_COUNT`.
-    menu_selection: u8,
+    /// Active OLED visualizer style. `Off` blanks the left pane.
+    oled_viz: OledViz,
+    /// Active underglow visualizer style. `Off` keeps the ring dark.
+    glow_viz: GlowViz,
+    /// On-device menu state. Drives input routing in `matrix_task` /
+    /// `encoder_task` and a full-screen replacement in `render_frame`.
+    menu: MenuView,
+    /// Currently highlighted main-menu row, `0..MENU_ITEM_COUNT`. Only
+    /// meaningful when `menu == MenuView::Main`.
+    main_selection: u8,
 }
 
 impl DisplayState {
@@ -188,10 +291,10 @@ impl DisplayState {
             last_message: Instant::from_ticks(0),
             bands: [0; 8],
             last_visualizer: Instant::from_ticks(0),
-            visualizer_enabled: true,
-            audio_rgb_enabled: true,
-            menu_open: false,
-            menu_selection: 0,
+            oled_viz: OledViz::Bars,
+            glow_viz: GlowViz::Spec,
+            menu: MenuView::Closed,
+            main_selection: 0,
         }
     }
 
@@ -208,11 +311,15 @@ impl DisplayState {
     }
 
     fn oled_viz_active(&self) -> bool {
-        self.visualizer_enabled && self.bands_fresh()
+        self.oled_viz != OledViz::Off && self.bands_fresh()
     }
 
-    fn audio_rgb_active(&self) -> bool {
-        self.audio_rgb_enabled && self.bands_fresh()
+    fn glow_viz_active(&self) -> bool {
+        self.glow_viz != GlowViz::Off && self.bands_fresh()
+    }
+
+    fn menu_open(&self) -> bool {
+        !matches!(self.menu, MenuView::Closed)
     }
 }
 
@@ -439,15 +546,20 @@ fn render_frame<D>(
         return;
     }
 
-    if snapshot.menu_open {
+    if snapshot.menu_open() {
         render_menu(display, text_style, &snapshot);
         return;
     }
 
-    // Left pane: spectrum bars while audio is flowing. Otherwise the area
-    // stays blank — the right-edge volume bar is the always-on indicator.
+    // Left pane: visualizer while audio is flowing. Style picked from
+    // `snapshot.oled_viz`; `Off` is filtered out by `oled_viz_active()`.
     if snapshot.oled_viz_active() {
-        render_visualizer(display, &snapshot.bands);
+        match snapshot.oled_viz {
+            OledViz::Bars => render_bars(display, &snapshot.bands),
+            OledViz::Mirror => render_mirror(display, &snapshot.bands),
+            OledViz::Dots => render_dots(display, &snapshot.bands),
+            OledViz::Off => {} // unreachable — gated above
+        }
     }
 
     // Vertical volume bar pinned to the right edge. Drawn last so a long
@@ -473,16 +585,21 @@ fn render_frame<D>(
     }
 }
 
-fn render_visualizer<D>(display: &mut D, bands: &[u8; 8])
+// Shared geometry for all OLED visualizer styles. 8 columns × 13 px wide with
+// a 1 px gap = 111 px, anchored at x=2; ends at x=112, leaving a 5 px gutter
+// before the volume outline at x=118.
+const VIZ_BAR_W: u32 = 13;
+const VIZ_GAP: i32 = 1;
+const VIZ_LEFT: i32 = 2;
+
+fn viz_column_x(i: usize) -> i32 {
+    VIZ_LEFT + i as i32 * (VIZ_BAR_W as i32 + VIZ_GAP)
+}
+
+fn render_bars<D>(display: &mut D, bands: &[u8; 8])
 where
     D: DrawTarget<Color = BinaryColor>,
 {
-    // Eight bars laid out left-of-the-volume-bar. 13 wide + 1 px gap × 8 =
-    // 111 px, starts at x=2, ends at x=112 — leaves a 5 px gutter before the
-    // volume outline at x=118.
-    const BAR_W: u32 = 13;
-    const GAP: i32 = 1;
-    const LEFT: i32 = 2;
     const BOTTOM: i32 = 63;
     const MAX_H: i32 = 60;
     for (i, &v) in bands.iter().enumerate() {
@@ -490,9 +607,53 @@ where
         if h <= 0 {
             continue;
         }
-        let x = LEFT + i as i32 * (BAR_W as i32 + GAP);
+        let x = viz_column_x(i);
         let y = BOTTOM - h + 1;
-        let _ = Rectangle::new(Point::new(x, y), Size::new(BAR_W, h as u32))
+        let _ = Rectangle::new(Point::new(x, y), Size::new(VIZ_BAR_W, h as u32))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display);
+    }
+}
+
+/// Centre-anchored bars: each band grows up *and* down from a horizontal mid
+/// line, like a stereo VU meter. Half-height ≈ 30 px each direction.
+fn render_mirror<D>(display: &mut D, bands: &[u8; 8])
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    const CENTER_Y: i32 = 32;
+    const MAX_HALF: i32 = 30;
+    for (i, &v) in bands.iter().enumerate() {
+        let h = (v as i32 * MAX_HALF) / 255;
+        if h <= 0 {
+            continue;
+        }
+        let x = viz_column_x(i);
+        // One rectangle spanning [center - h, center + h] — height = 2*h.
+        let y = CENTER_Y - h;
+        let _ = Rectangle::new(Point::new(x, y), Size::new(VIZ_BAR_W, (h * 2) as u32))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display);
+    }
+}
+
+/// Peak-dot mode: a single short cap at the height each bar would reach. Cheap
+/// and the empty space below makes individual hits easier to read at a glance.
+fn render_dots<D>(display: &mut D, bands: &[u8; 8])
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    const BOTTOM: i32 = 63;
+    const MAX_H: i32 = 60;
+    const DOT_H: u32 = 3;
+    for (i, &v) in bands.iter().enumerate() {
+        let h = (v as i32 * MAX_H) / 255;
+        if h <= 0 {
+            continue;
+        }
+        let x = viz_column_x(i);
+        let y = (BOTTOM - h + 1).max(0);
+        let _ = Rectangle::new(Point::new(x, y), Size::new(VIZ_BAR_W, DOT_H))
             .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
             .draw(display);
     }
@@ -505,35 +666,35 @@ fn render_menu<D>(
 ) where
     D: DrawTarget<Color = BinaryColor>,
 {
+    match snapshot.menu {
+        MenuView::Closed => {} // shouldn't reach here — render_frame guards
+        MenuView::Main => render_main_menu(display, text_style, snapshot),
+        MenuView::Sub(sel) => render_submenu(display, text_style, sel, snapshot),
+    }
+}
+
+fn render_main_menu<D>(
+    display: &mut D,
+    text_style: &embedded_graphics::mono_font::MonoTextStyle<'_, BinaryColor>,
+    snapshot: &DisplayState,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
     // Full-screen replacement: title up top, three rows below. `>` cursor
     // marks the highlighted row — simpler than inverting the text background
-    // and reads fine on the 128×64 OLED. Right-hand column shows ON/OFF for
-    // toggles or "Go" for actions.
+    // and reads fine on the 128×64 OLED. Right column shows the active option
+    // for selectors or "Go" for actions; "Bootloader" lives there too.
     let _ =
         Text::with_baseline("MENU", Point::new(52, 2), *text_style, Baseline::Top).draw(display);
 
     let items: [(&str, &str); MENU_ITEM_COUNT as usize] = [
-        (
-            "Visualizer",
-            if snapshot.visualizer_enabled {
-                "ON"
-            } else {
-                "OFF"
-            },
-        ),
-        (
-            "Audio RGB",
-            if snapshot.audio_rgb_enabled {
-                "ON"
-            } else {
-                "OFF"
-            },
-        ),
+        ("oled viz", snapshot.oled_viz.label()),
+        ("glow viz", snapshot.glow_viz.label()),
         ("Bootloader", "Go"),
     ];
     for (i, (label, right)) in items.iter().enumerate() {
         let y = 22 + (i as i32) * 14;
-        if i as u8 == snapshot.menu_selection {
+        if i as u8 == snapshot.main_selection {
             let _ = Text::with_baseline(">", Point::new(4, y), *text_style, Baseline::Top)
                 .draw(display);
         }
@@ -542,6 +703,124 @@ fn render_menu<D>(
         let _ = Text::with_baseline(right, Point::new(104, y), *text_style, Baseline::Top)
             .draw(display);
     }
+}
+
+fn render_submenu<D>(
+    display: &mut D,
+    text_style: &embedded_graphics::mono_font::MonoTextStyle<'_, BinaryColor>,
+    selector: Selector,
+    snapshot: &DisplayState,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    // Submenus list every option for the selector. The `>` cursor sits on the
+    // *current* enum value — no separate draft index; encoder rotation mutates
+    // the live value so the change is visible the moment you exit the menu.
+    let title = match selector {
+        Selector::OledViz => "OLED VIZ",
+        Selector::GlowViz => "GLOW VIZ",
+    };
+    // Title at x=40 (FONT_6X10 → 8 chars × 6 = 48 px gives room either side).
+    let _ = Text::with_baseline(title, Point::new(40, 2), *text_style, Baseline::Top).draw(display);
+
+    // Helper to draw one row given an index, label, and "is selected".
+    let draw_row = |i: usize, label: &str, selected: bool, display: &mut D| {
+        let y = 18 + (i as i32) * 12;
+        if selected {
+            let _ = Text::with_baseline(">", Point::new(4, y), *text_style, Baseline::Top)
+                .draw(display);
+        }
+        let _ =
+            Text::with_baseline(label, Point::new(14, y), *text_style, Baseline::Top).draw(display);
+    };
+
+    match selector {
+        Selector::OledViz => {
+            for (i, &variant) in OledViz::ALL.iter().enumerate() {
+                draw_row(
+                    i,
+                    variant.long_label(),
+                    variant == snapshot.oled_viz,
+                    display,
+                );
+            }
+        }
+        Selector::GlowViz => {
+            for (i, &variant) in GlowViz::ALL.iter().enumerate() {
+                draw_row(
+                    i,
+                    variant.long_label(),
+                    variant == snapshot.glow_viz,
+                    display,
+                );
+            }
+        }
+    }
+}
+
+// ─── Glow visualizer renderers ─────────────────────────────────────────────
+
+/// Spectrum mirrored around the front-of-device LED (chain index = `pivot` ≈
+/// 6 o'clock, the side closest to the user). Bass pulses at the centre and
+/// treble walks both ways toward the back of the ring, so a kick lands in
+/// front of you instead of dragging across the whole strip.
+fn render_glow_spec(
+    frame: &mut [RGB8; NUM_LEDS],
+    bands: &[u8; 8],
+    underglow_start: usize,
+    underglow_count: usize,
+    pivot: usize,
+    accent: RGB8,
+) {
+    let center_offset = pivot as i32 - underglow_start as i32;
+    let count_i32 = underglow_count as i32;
+    let half = count_i32 / 2;
+    for i in 0..underglow_count {
+        let raw = (i as i32 - center_offset).rem_euclid(count_i32);
+        // `dist` is 0..=half; lerp between adjacent bands in 8.8 fixed point.
+        let dist = raw.min(count_i32 - raw);
+        let band_pos = (dist as u32 * 7 * 256) / half as u32;
+        let bi = (band_pos / 256) as usize;
+        let frac = band_pos % 256;
+        let v0 = bands[bi.min(7)] as u32;
+        let v1 = bands[(bi + 1).min(7)] as u32;
+        let lin = (v0 * (256 - frac) + v1 * frac) / 256;
+        // Square-law gamma so quiet noise stays dark and beats stand out
+        // instead of glowing the whole ring.
+        let factor = (lin * lin) / 255;
+        frame[underglow_start + i] = scale_rgb(accent, factor);
+    }
+}
+
+/// Uniform-brightness fill across the whole underglow ring. Used by both `Vu`
+/// (input = average band magnitude → ring breathes with overall energy) and
+/// `Bass` (input = low-band magnitude → ring only pulses on kick hits).
+fn render_glow_uniform(
+    frame: &mut [RGB8; NUM_LEDS],
+    magnitude: u8,
+    underglow_start: usize,
+    underglow_count: usize,
+    accent: RGB8,
+) {
+    let lin = magnitude as u32;
+    let factor = (lin * lin) / 255;
+    let color = scale_rgb(accent, factor);
+    for px in &mut frame[underglow_start..underglow_start + underglow_count] {
+        *px = color;
+    }
+}
+
+fn scale_rgb(c: RGB8, factor: u32) -> RGB8 {
+    RGB8 {
+        r: ((c.r as u32 * factor) / 255) as u8,
+        g: ((c.g as u32 * factor) / 255) as u8,
+        b: ((c.b as u32 * factor) / 255) as u8,
+    }
+}
+
+fn avg_band(bands: &[u8; 8]) -> u8 {
+    let sum: u32 = bands.iter().map(|&b| b as u32).sum();
+    (sum / 8) as u8
 }
 
 // ─── CDC receive loop ──────────────────────────────────────────────────────
@@ -683,11 +962,11 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
         }
 
         // Snapshot viz state once per tick — direct read avoids saturating
-        // `LED_EVENTS` at 60 Hz host frame rate. `audio_rgb_active` gates the
-        // underglow side independently from the OLED bars (menu item 1).
-        let (viz_active, viz_bands) = DISPLAY_STATE.lock(|s| {
+        // `LED_EVENTS` at 60 Hz host frame rate. `glow_viz_active` gates the
+        // underglow side independently from the OLED visualizer (menu row 1).
+        let (viz_active, viz_bands, glow_viz) = DISPLAY_STATE.lock(|s| {
             let s = s.borrow();
-            (s.audio_rgb_active(), s.bands)
+            (s.glow_viz_active(), s.bands, s.glow_viz)
         });
 
         for i in 0..PER_KEY_END {
@@ -761,32 +1040,32 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
             _ => {
                 effect = None;
                 if viz_active {
-                    // Spectrum mirrored around the front-of-device LED (chain
-                    // index 13 ≈ 6 o'clock, the side closest to the user). Bass
-                    // pulses at the centre and treble walks both ways toward
-                    // the back of the ring, so a kick lands in front of you
-                    // instead of dragging across the whole strip.
-                    const CENTER_OFFSET: i32 = SPIRAL_PIVOT as i32 - UNDERGLOW_START as i32;
-                    const HALF: i32 = (UNDERGLOW_COUNT as i32) / 2;
-                    const COUNT_I32: i32 = UNDERGLOW_COUNT as i32;
-                    for i in 0..UNDERGLOW_COUNT {
-                        let raw = (i as i32 - CENTER_OFFSET).rem_euclid(COUNT_I32);
-                        let dist = raw.min(COUNT_I32 - raw); // 0..=HALF
-                                                             // Lerp between adjacent bands in 8.8 fixed point.
-                        let band_pos = (dist as u32 * 7 * 256) / HALF as u32;
-                        let bi = (band_pos / 256) as usize;
-                        let frac = band_pos % 256;
-                        let v0 = viz_bands[bi.min(7)] as u32;
-                        let v1 = viz_bands[(bi + 1).min(7)] as u32;
-                        let lin = (v0 * (256 - frac) + v1 * frac) / 256;
-                        // Square-law gamma so quiet noise stays dark and
-                        // beats stand out instead of glowing the whole ring.
-                        let factor = (lin * lin) / 255;
-                        frame[UNDERGLOW_START + i] = RGB8 {
-                            r: ((ACCENT_UNDERGLOW.r as u32 * factor) / 255) as u8,
-                            g: ((ACCENT_UNDERGLOW.g as u32 * factor) / 255) as u8,
-                            b: ((ACCENT_UNDERGLOW.b as u32 * factor) / 255) as u8,
-                        };
+                    match glow_viz {
+                        GlowViz::Spec => render_glow_spec(
+                            &mut frame,
+                            &viz_bands,
+                            UNDERGLOW_START,
+                            UNDERGLOW_COUNT,
+                            SPIRAL_PIVOT,
+                            ACCENT_UNDERGLOW,
+                        ),
+                        GlowViz::Vu => render_glow_uniform(
+                            &mut frame,
+                            avg_band(&viz_bands),
+                            UNDERGLOW_START,
+                            UNDERGLOW_COUNT,
+                            ACCENT_UNDERGLOW,
+                        ),
+                        GlowViz::Bass => render_glow_uniform(
+                            &mut frame,
+                            // Average the two lowest bands so a kick reads
+                            // across both sub-bass and bass bins.
+                            ((viz_bands[0] as u16 + viz_bands[1] as u16) / 2) as u8,
+                            UNDERGLOW_START,
+                            UNDERGLOW_COUNT,
+                            ACCENT_UNDERGLOW,
+                        ),
+                        GlowViz::Off => {} // unreachable — viz_active false
                     }
                 } else {
                     for px in &mut frame[UNDERGLOW_START..NUM_LEDS] {
@@ -890,7 +1169,7 @@ async fn matrix_task(matrix: [Input<'static>; 9]) {
             }
 
             if pressed[i] && !was_pressed {
-                let menu_open = DISPLAY_STATE.lock(|s| s.borrow().menu_open);
+                let menu_open = DISPLAY_STATE.lock(|s| s.borrow().menu_open());
 
                 // Suppress media-key HID (PrevTrack/PlayPause/NextTrack/Stop)
                 // while the menu is open so navigation can't fire them.
@@ -910,28 +1189,38 @@ async fn matrix_task(matrix: [Input<'static>; 9]) {
                 if i == 2 {
                     let _ = DEVICE_TX_EVENTS.try_send(DeviceToHost::EncoderClick);
                 }
-                // matrix[5] (key below the encoder) doubles as menu-open and
-                // OK/toggle. KEYMAP[5]=None, so no HID is gated here.
+                // matrix[5] (key below the encoder) is the OK key. KEYMAP[5] =
+                // None, so no HID gating concerns. State transitions:
+                //   Closed             → Main, main_selection=0
+                //   Main + sel 0       → Sub(OledViz)
+                //   Main + sel 1       → Sub(GlowViz)
+                //   Main + sel 2       → enter USB bootloader (no return)
+                //   Sub(_)             → back to Main
                 if i == 5 {
                     let enter_bootloader = DISPLAY_STATE.lock(|s| {
                         let mut s = s.borrow_mut();
-                        if s.menu_open {
-                            match s.menu_selection {
+                        match s.menu {
+                            MenuView::Closed => {
+                                s.menu = MenuView::Main;
+                                s.main_selection = 0;
+                                false
+                            }
+                            MenuView::Main => match s.main_selection {
                                 0 => {
-                                    s.visualizer_enabled = !s.visualizer_enabled;
+                                    s.menu = MenuView::Sub(Selector::OledViz);
                                     false
                                 }
                                 1 => {
-                                    s.audio_rgb_enabled = !s.audio_rgb_enabled;
+                                    s.menu = MenuView::Sub(Selector::GlowViz);
                                     false
                                 }
                                 2 => true,
                                 _ => false,
+                            },
+                            MenuView::Sub(_) => {
+                                s.menu = MenuView::Main;
+                                false
                             }
-                        } else {
-                            s.menu_open = true;
-                            s.menu_selection = 0;
-                            false
                         }
                     });
                     // Bootloader entry: identical to the boot-time bootmagic
@@ -944,10 +1233,18 @@ async fn matrix_task(matrix: [Input<'static>; 9]) {
                         loop {}
                     }
                 }
-                // matrix[8] (bottom-right) closes the menu when open;
-                // unbound otherwise.
+                // matrix[8] (bottom-right) is the back/close key:
+                //   Sub(_) → Main (back one level)
+                //   Main   → Closed (exit menu)
+                // Unbound when menu isn't open.
                 if i == 8 && menu_open {
-                    DISPLAY_STATE.lock(|s| s.borrow_mut().menu_open = false);
+                    DISPLAY_STATE.lock(|s| {
+                        let mut s = s.borrow_mut();
+                        s.menu = match s.menu {
+                            MenuView::Sub(_) => MenuView::Main,
+                            _ => MenuView::Closed,
+                        };
+                    });
                 }
             }
         }
@@ -990,34 +1287,56 @@ async fn encoder_task(pin_a: Peri<'static, PIN_11>, pin_b: Peri<'static, PIN_10>
 
         if accumulator >= 4 {
             accumulator = 0;
-            let menu_open = DISPLAY_STATE.lock(|s| {
-                let mut s = s.borrow_mut();
-                if s.menu_open {
-                    s.menu_selection = (s.menu_selection + 1) % MENU_ITEM_COUNT;
-                    true
-                } else {
-                    false
-                }
-            });
-            if !menu_open {
+            if !apply_encoder_step(1) {
                 CONSUMER_EVENTS.send(ConsumerKey::VolumeUp).await;
             }
         } else if accumulator <= -4 {
             accumulator = 0;
-            let menu_open = DISPLAY_STATE.lock(|s| {
-                let mut s = s.borrow_mut();
-                if s.menu_open {
-                    s.menu_selection = (s.menu_selection + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
-                    true
-                } else {
-                    false
-                }
-            });
-            if !menu_open {
+            if !apply_encoder_step(-1) {
                 CONSUMER_EVENTS.send(ConsumerKey::VolumeDown).await;
             }
         }
     }
+}
+
+/// Handle one encoder detent. Returns `true` if the menu consumed it (no HID
+/// emitted), `false` if the menu was closed (caller should send Volume HID).
+///
+/// `step` is +1 for clockwise, -1 for counter-clockwise. In a submenu both
+/// directions cycle the live enum value; on the main menu they move the
+/// highlighted row.
+fn apply_encoder_step(step: i8) -> bool {
+    DISPLAY_STATE.lock(|s| {
+        let mut s = s.borrow_mut();
+        match s.menu {
+            MenuView::Closed => false,
+            MenuView::Main => {
+                let n = MENU_ITEM_COUNT;
+                if step >= 0 {
+                    s.main_selection = (s.main_selection + 1) % n;
+                } else {
+                    s.main_selection = (s.main_selection + n - 1) % n;
+                }
+                true
+            }
+            MenuView::Sub(Selector::OledViz) => {
+                s.oled_viz = if step >= 0 {
+                    s.oled_viz.next()
+                } else {
+                    s.oled_viz.prev()
+                };
+                true
+            }
+            MenuView::Sub(Selector::GlowViz) => {
+                s.glow_viz = if step >= 0 {
+                    s.glow_viz.next()
+                } else {
+                    s.glow_viz.prev()
+                };
+                true
+            }
+        }
+    })
 }
 
 struct Disconnected;
