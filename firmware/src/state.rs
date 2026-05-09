@@ -64,20 +64,31 @@ pub struct VolumeInfo {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum OledViz {
     Bars,
-    Mirror,
-    Dots,
+    Waterfall,
+    Radial,
+    VuNeedle,
+    Particles,
     Off,
 }
 
 impl OledViz {
-    pub const ALL: &'static [Self] = &[Self::Bars, Self::Mirror, Self::Dots, Self::Off];
+    pub const ALL: &'static [Self] = &[
+        Self::Bars,
+        Self::Waterfall,
+        Self::Radial,
+        Self::VuNeedle,
+        Self::Particles,
+        Self::Off,
+    ];
 
     /// Short label (≤4 chars) for the right column of the main menu.
     pub fn label(self) -> &'static str {
         match self {
             Self::Bars => "bars",
-            Self::Mirror => "mirr",
-            Self::Dots => "dots",
+            Self::Waterfall => "wfll",
+            Self::Radial => "radl",
+            Self::VuNeedle => "vu",
+            Self::Particles => "prtc",
             Self::Off => "off",
         }
     }
@@ -86,8 +97,10 @@ impl OledViz {
     pub fn long_label(self) -> &'static str {
         match self {
             Self::Bars => "bars",
-            Self::Mirror => "mirror",
-            Self::Dots => "dots",
+            Self::Waterfall => "waterfall",
+            Self::Radial => "radial",
+            Self::VuNeedle => "vu needle",
+            Self::Particles => "particles",
             Self::Off => "off",
         }
     }
@@ -104,19 +117,19 @@ impl OledViz {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum GlowViz {
     Spec,
-    Vu,
-    Bass,
+    Ripple,
+    Comet,
     Off,
 }
 
 impl GlowViz {
-    pub const ALL: &'static [Self] = &[Self::Spec, Self::Vu, Self::Bass, Self::Off];
+    pub const ALL: &'static [Self] = &[Self::Spec, Self::Ripple, Self::Comet, Self::Off];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Spec => "spec",
-            Self::Vu => "vu",
-            Self::Bass => "bass",
+            Self::Ripple => "rppl",
+            Self::Comet => "comt",
             Self::Off => "off",
         }
     }
@@ -124,9 +137,42 @@ impl GlowViz {
     pub fn long_label(self) -> &'static str {
         match self {
             Self::Spec => "spectrum",
-            Self::Vu => "vu",
-            Self::Bass => "bass",
+            Self::Ripple => "ripple",
+            Self::Comet => "comet",
             Self::Off => "off",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        cycle(Self::ALL, self, 1)
+    }
+    pub fn prev(self) -> Self {
+        cycle(Self::ALL, self, -1)
+    }
+}
+
+/// Underglow accent colour mode. `Static` pins the warm-orange accent;
+/// `Dynamic` shifts it redder on bass and warmer on treble per frame.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum HueMode {
+    Static,
+    Dynamic,
+}
+
+impl HueMode {
+    pub const ALL: &'static [Self] = &[Self::Static, Self::Dynamic];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Static => "stat",
+            Self::Dynamic => "dyn",
+        }
+    }
+
+    pub fn long_label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Dynamic => "dynamic",
         }
     }
 
@@ -161,11 +207,12 @@ pub enum MenuView {
 pub enum Selector {
     OledViz,
     GlowViz,
+    HueMode,
 }
 
-/// Number of rows in the main menu (oled viz, glow viz, Bootloader). Used to
-/// wrap encoder rotation when navigating the main menu.
-pub const MENU_ITEM_COUNT: u8 = 3;
+/// Number of rows in the main menu (oled viz, glow viz, hue, Bootloader).
+/// Used to wrap encoder rotation when navigating the main menu.
+pub const MENU_ITEM_COUNT: u8 = 4;
 
 #[derive(Clone)]
 pub struct DisplayState {
@@ -181,6 +228,9 @@ pub struct DisplayState {
     pub oled_viz: OledViz,
     /// Active underglow visualizer style. `Off` keeps the ring dark.
     pub glow_viz: GlowViz,
+    /// Underglow hue: `Static` for the fixed accent, `Dynamic` for a
+    /// content-driven shift (bass→red, treble→warm).
+    pub hue_mode: HueMode,
     /// On-device menu state. Drives input routing in `matrix_task` /
     /// `encoder_task` and a full-screen replacement in `render_frame`.
     pub menu: MenuView,
@@ -201,6 +251,7 @@ impl DisplayState {
             last_visualizer: Instant::from_ticks(0),
             oled_viz: OledViz::Bars,
             glow_viz: GlowViz::Spec,
+            hue_mode: HueMode::Static,
             menu: MenuView::Closed,
             main_selection: 0,
         }
@@ -220,10 +271,6 @@ impl DisplayState {
 
     pub fn oled_viz_active(&self) -> bool {
         self.oled_viz != OledViz::Off && self.bands_fresh()
-    }
-
-    pub fn glow_viz_active(&self) -> bool {
-        self.glow_viz != GlowViz::Off && self.bands_fresh()
     }
 
     pub fn menu_open(&self) -> bool {
@@ -303,6 +350,14 @@ pub fn apply_encoder_step(step: i8) -> bool {
                     s.glow_viz.next()
                 } else {
                     s.glow_viz.prev()
+                };
+                true
+            }
+            MenuView::Sub(Selector::HueMode) => {
+                s.hue_mode = if step >= 0 {
+                    s.hue_mode.next()
+                } else {
+                    s.hue_mode.prev()
                 };
                 true
             }

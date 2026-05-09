@@ -47,7 +47,7 @@ use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306Async};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-use crate::display::render_frame;
+use crate::display::{render_frame, OledVizState};
 use crate::input::{encoder_task, matrix_task};
 use crate::led::{led_task, NUM_LEDS};
 use crate::usb::{
@@ -182,9 +182,10 @@ async fn main(spawner: Spawner) {
     let display_fut = async {
         let mut ticker = Ticker::every(Duration::from_millis(33));
         let mut last_ok = true;
+        let mut viz_state = OledVizState::new();
         loop {
             ticker.next().await;
-            render_frame(&mut display, &text_style);
+            render_frame(&mut display, &text_style, &mut viz_state);
             // I2C glitches (cable wiggle, EMI) shouldn't kill the firmware —
             // log on transition and let the next tick retry.
             match display.flush().await {

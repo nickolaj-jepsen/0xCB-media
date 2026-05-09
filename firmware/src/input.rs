@@ -96,7 +96,8 @@ pub async fn matrix_task(matrix: [Input<'static>; 9]) {
                 //   Closed             → Main, main_selection=0
                 //   Main + sel 0       → Sub(OledViz)
                 //   Main + sel 1       → Sub(GlowViz)
-                //   Main + sel 2       → enter USB bootloader (no return)
+                //   Main + sel 2       → Sub(HueMode)
+                //   Main + sel 3       → enter USB bootloader (no return)
                 //   Sub(_)             → back to Main
                 if i == 5 {
                     let enter_bootloader = DISPLAY_STATE.lock(|s| {
@@ -116,7 +117,11 @@ pub async fn matrix_task(matrix: [Input<'static>; 9]) {
                                     s.menu = MenuView::Sub(Selector::GlowViz);
                                     false
                                 }
-                                2 => true,
+                                2 => {
+                                    s.menu = MenuView::Sub(Selector::HueMode);
+                                    false
+                                }
+                                3 => true,
                                 _ => false,
                             },
                             MenuView::Sub(_) => {
