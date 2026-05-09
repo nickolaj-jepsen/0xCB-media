@@ -15,6 +15,11 @@ license = "GPL-2.0-or-later"
 repository = "https://github.com/0xCB-media/0xCB-media"
 authors = ["Nickolaj <nickolaj1177@gmail.com>"]
 
+# Per-crate opt-in via `[lints] workspace = true`. CI already runs clippy with
+# `-D warnings`; this just makes the same lints fire in IDE/local builds.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+
 [profile.release]
 debug = true            # keep symbols for probe-rs / defmt
 lto = "fat"

@@ -50,3 +50,6 @@ static_cell = "2.1.1"
 # via the critical-section impl provided by embassy-rp's `critical-section-impl`
 # feature. Required so static_cell, embassy-sync, etc. compile for thumbv6m.
 portable-atomic = { version = "1.5", features = ["critical-section"] }
+
+[lints]
+workspace = true

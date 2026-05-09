@@ -280,17 +280,17 @@ async fn main(spawner: Spawner) {
         p.PIN_25,
         &ws2812_prg,
     );
-    spawner.spawn(led_task(ws2812).unwrap());
+    spawner.spawn(led_task(ws2812).expect("led_task spawn"));
 
     // EC11 encoder via plain GPIO interrupts — pin A on GP11, pin B on GP10.
-    spawner.spawn(encoder_task(p.PIN_11, p.PIN_10).unwrap());
+    spawner.spawn(encoder_task(p.PIN_11, p.PIN_10).expect("encoder_task spawn"));
 
     // I²C1 OLED on (SCL=GP3, SDA=GP2).
     let i2c = I2c::new_async(p.I2C1, p.PIN_3, p.PIN_2, Irqs, i2c::Config::default());
     let interface = I2CDisplayInterface::new(i2c);
     let mut display = Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
-    display.init().await.unwrap();
+    display.init().await.expect("OLED I2C init");
 
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
@@ -342,20 +342,36 @@ async fn main(spawner: Spawner) {
     );
 
     let usb = builder.build();
-    spawner.spawn(usb_task(usb).unwrap());
-    spawner.spawn(hid_writer_task(hid_writer).unwrap());
-    spawner.spawn(matrix_task(matrix).unwrap());
-    spawner.spawn(cdc_tx_task(cdc_tx).unwrap());
+    spawner.spawn(usb_task(usb).expect("usb_task spawn"));
+    spawner.spawn(hid_writer_task(hid_writer).expect("hid_writer_task spawn"));
+    spawner.spawn(matrix_task(matrix).expect("matrix_task spawn"));
+    spawner.spawn(cdc_tx_task(cdc_tx).expect("cdc_tx_task spawn"));
 
     info!("USB started; awaiting host connection");
 
     // ─── Display loop and CDC RX run concurrently in main ──────────────────
     let display_fut = async {
         let mut ticker = Ticker::every(Duration::from_millis(33));
+        let mut last_ok = true;
         loop {
             ticker.next().await;
             render_frame(&mut display, &text_style);
-            display.flush().await.unwrap();
+            // I2C glitches (cable wiggle, EMI) shouldn't kill the firmware —
+            // log on transition and let the next tick retry.
+            match display.flush().await {
+                Ok(()) => {
+                    if !last_ok {
+                        info!("OLED flush recovered");
+                        last_ok = true;
+                    }
+                }
+                Err(_) => {
+                    if last_ok {
+                        defmt::warn!("OLED flush failed; continuing");
+                        last_ok = false;
+                    }
+                }
+            }
         }
     };
 

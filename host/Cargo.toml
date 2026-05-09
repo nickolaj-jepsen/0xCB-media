@@ -25,3 +25,6 @@ arc-swap = "1"
 realfft = "3"
 pipewire = "0.8"
 libspa = "0.8"
+
+[lints]
+workspace = true

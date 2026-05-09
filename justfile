@@ -8,6 +8,23 @@ mount  := "/run/media/" + env_var('USER') + "/RPI-RP2"
 default:
     @just --list
 
+# Format the entire workspace (firmware included).
+fmt:
+    cargo fmt --all
+
+# Same as `cargo fmt --all -- --check` in CI; non-zero exit on diff.
+fmt-check:
+    cargo fmt --all -- --check
+
+# Mirror CI: clippy on host+proto, then on firmware (different target).
+clippy:
+    cargo clippy -p host -p proto --all-targets -- -D warnings
+    cd firmware && cargo clippy --all-targets -- -D warnings
+
+# Mirror CI: tests on host+proto only (firmware is no_std, `test = false`).
+test:
+    cargo test -p host -p proto --all-targets
+
 # Build the firmware ELF (release).
 build:
     cd firmware && cargo build --release
