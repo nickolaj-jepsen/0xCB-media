@@ -7,8 +7,9 @@
 //! when the encoder is pressed.
 //!
 //! `DISPLAY_STATE` is the shared state: CDC RX writes, the display loop and
-//! the LED task read, and the matrix task flips `visualizer_enabled` when
-//! the user presses the key below the encoder.
+//! the LED task read, and the matrix / encoder tasks drive the on-device
+//! settings menu (visualizer + audio-RGB toggles) when the user opens it
+//! with the key below the encoder.
 //!
 //! The display loop and `cdc_rx_loop` run inside `main` via
 //! `embassy_futures::join` rather than as spawned tasks because the OLED
@@ -149,6 +150,10 @@ struct VolumeInfo {
     muted: bool,
 }
 
+/// Number of items in the on-device settings menu. Used to wrap encoder
+/// rotation when the menu is open.
+const MENU_ITEM_COUNT: u8 = 3;
+
 #[derive(Clone)]
 struct DisplayState {
     volume: VolumeInfo,
@@ -159,10 +164,18 @@ struct DisplayState {
     /// they're considered fresh enough to render.
     bands: [u8; 8],
     last_visualizer: Instant,
-    /// User toggle (button below the encoder). When false, viz frames from
-    /// the host are accepted but not rendered, so the underglow ring stays
-    /// dark instead of pulsing along with audio.
+    /// Renders the FFT bars on the OLED when host audio is flowing. Toggled
+    /// from the on-device menu (item 0).
     visualizer_enabled: bool,
+    /// Renders the audio-reactive spectrum on the underglow ring. Independent
+    /// of `visualizer_enabled`. Toggled from the on-device menu (item 1).
+    audio_rgb_enabled: bool,
+    /// True while the user is navigating the on-device settings menu. Drives
+    /// input routing in `matrix_task` / `encoder_task` and a full-screen
+    /// replacement in `render_frame`.
+    menu_open: bool,
+    /// Currently highlighted menu item, `0..MENU_ITEM_COUNT`.
+    menu_selection: u8,
 }
 
 impl DisplayState {
@@ -176,6 +189,9 @@ impl DisplayState {
             bands: [0; 8],
             last_visualizer: Instant::from_ticks(0),
             visualizer_enabled: true,
+            audio_rgb_enabled: true,
+            menu_open: false,
+            menu_selection: 0,
         }
     }
 
@@ -186,10 +202,17 @@ impl DisplayState {
             && self.last_message.elapsed() < Duration::from_secs(5)
     }
 
-    fn visualizer_active(&self) -> bool {
-        self.visualizer_enabled
-            && self.last_visualizer != Instant::from_ticks(0)
+    fn bands_fresh(&self) -> bool {
+        self.last_visualizer != Instant::from_ticks(0)
             && self.last_visualizer.elapsed() < Duration::from_millis(500)
+    }
+
+    fn oled_viz_active(&self) -> bool {
+        self.visualizer_enabled && self.bands_fresh()
+    }
+
+    fn audio_rgb_active(&self) -> bool {
+        self.audio_rgb_enabled && self.bands_fresh()
     }
 }
 
@@ -416,9 +439,14 @@ fn render_frame<D>(
         return;
     }
 
+    if snapshot.menu_open {
+        render_menu(display, text_style, &snapshot);
+        return;
+    }
+
     // Left pane: spectrum bars while audio is flowing. Otherwise the area
     // stays blank — the right-edge volume bar is the always-on indicator.
-    if snapshot.visualizer_active() {
+    if snapshot.oled_viz_active() {
         render_visualizer(display, &snapshot.bands);
     }
 
@@ -466,6 +494,52 @@ where
         let y = BOTTOM - h + 1;
         let _ = Rectangle::new(Point::new(x, y), Size::new(BAR_W, h as u32))
             .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display);
+    }
+}
+
+fn render_menu<D>(
+    display: &mut D,
+    text_style: &embedded_graphics::mono_font::MonoTextStyle<'_, BinaryColor>,
+    snapshot: &DisplayState,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    // Full-screen replacement: title up top, three rows below. `>` cursor
+    // marks the highlighted row — simpler than inverting the text background
+    // and reads fine on the 128×64 OLED. Right-hand column shows ON/OFF for
+    // toggles or "Go" for actions.
+    let _ =
+        Text::with_baseline("MENU", Point::new(52, 2), *text_style, Baseline::Top).draw(display);
+
+    let items: [(&str, &str); MENU_ITEM_COUNT as usize] = [
+        (
+            "Visualizer",
+            if snapshot.visualizer_enabled {
+                "ON"
+            } else {
+                "OFF"
+            },
+        ),
+        (
+            "Audio RGB",
+            if snapshot.audio_rgb_enabled {
+                "ON"
+            } else {
+                "OFF"
+            },
+        ),
+        ("Bootloader", "Go"),
+    ];
+    for (i, (label, right)) in items.iter().enumerate() {
+        let y = 22 + (i as i32) * 14;
+        if i as u8 == snapshot.menu_selection {
+            let _ = Text::with_baseline(">", Point::new(4, y), *text_style, Baseline::Top)
+                .draw(display);
+        }
+        let _ =
+            Text::with_baseline(label, Point::new(14, y), *text_style, Baseline::Top).draw(display);
+        let _ = Text::with_baseline(right, Point::new(104, y), *text_style, Baseline::Top)
             .draw(display);
     }
 }
@@ -609,10 +683,11 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
         }
 
         // Snapshot viz state once per tick — direct read avoids saturating
-        // `LED_EVENTS` at 60 Hz host frame rate.
+        // `LED_EVENTS` at 60 Hz host frame rate. `audio_rgb_active` gates the
+        // underglow side independently from the OLED bars (menu item 1).
         let (viz_active, viz_bands) = DISPLAY_STATE.lock(|s| {
             let s = s.borrow();
-            (s.visualizer_active(), s.bands)
+            (s.audio_rgb_active(), s.bands)
         });
 
         for i in 0..PER_KEY_END {
@@ -815,8 +890,16 @@ async fn matrix_task(matrix: [Input<'static>; 9]) {
             }
 
             if pressed[i] && !was_pressed {
-                if let Some(key) = KEYMAP[i] {
-                    let _ = CONSUMER_EVENTS.try_send(key);
+                let menu_open = DISPLAY_STATE.lock(|s| s.borrow().menu_open);
+
+                // Suppress media-key HID (PrevTrack/PlayPause/NextTrack/Stop)
+                // while the menu is open so navigation can't fire them.
+                // Encoder click (i==2 → Mute) is intentionally exempt — Mute
+                // stays available from inside the menu.
+                if !menu_open || i == 2 {
+                    if let Some(key) = KEYMAP[i] {
+                        let _ = CONSUMER_EVENTS.try_send(key);
+                    }
                 }
                 if let Some(led) = MATRIX_TO_LED[i] {
                     let _ = LED_EVENTS.try_send(LedCommand::KeyPress { led });
@@ -827,17 +910,44 @@ async fn matrix_task(matrix: [Input<'static>; 9]) {
                 if i == 2 {
                     let _ = DEVICE_TX_EVENTS.try_send(DeviceToHost::EncoderClick);
                 }
-                // matrix [1,2] = the key directly below the encoder. Bound
-                // locally to "toggle the underglow visualizer" — host stays
-                // unaware and keeps streaming bands; firmware just stops
-                // rendering them.
+                // matrix[5] (key below the encoder) doubles as menu-open and
+                // OK/toggle. KEYMAP[5]=None, so no HID is gated here.
                 if i == 5 {
-                    let enabled = DISPLAY_STATE.lock(|s| {
+                    let enter_bootloader = DISPLAY_STATE.lock(|s| {
                         let mut s = s.borrow_mut();
-                        s.visualizer_enabled = !s.visualizer_enabled;
-                        s.visualizer_enabled
+                        if s.menu_open {
+                            match s.menu_selection {
+                                0 => {
+                                    s.visualizer_enabled = !s.visualizer_enabled;
+                                    false
+                                }
+                                1 => {
+                                    s.audio_rgb_enabled = !s.audio_rgb_enabled;
+                                    false
+                                }
+                                2 => true,
+                                _ => false,
+                            }
+                        } else {
+                            s.menu_open = true;
+                            s.menu_selection = 0;
+                            false
+                        }
                     });
-                    info!("visualizer toggled: enabled={}", enabled);
+                    // Bootloader entry: identical to the boot-time bootmagic
+                    // path, just user-triggered from the menu instead of
+                    // requiring a re-plug while holding the encoder.
+                    if enter_bootloader {
+                        info!("menu: entering USB bootloader");
+                        embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+                        #[allow(clippy::empty_loop)]
+                        loop {}
+                    }
+                }
+                // matrix[8] (bottom-right) closes the menu when open;
+                // unbound otherwise.
+                if i == 8 && menu_open {
+                    DISPLAY_STATE.lock(|s| s.borrow_mut().menu_open = false);
                 }
             }
         }
@@ -880,10 +990,32 @@ async fn encoder_task(pin_a: Peri<'static, PIN_11>, pin_b: Peri<'static, PIN_10>
 
         if accumulator >= 4 {
             accumulator = 0;
-            CONSUMER_EVENTS.send(ConsumerKey::VolumeUp).await;
+            let menu_open = DISPLAY_STATE.lock(|s| {
+                let mut s = s.borrow_mut();
+                if s.menu_open {
+                    s.menu_selection = (s.menu_selection + 1) % MENU_ITEM_COUNT;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !menu_open {
+                CONSUMER_EVENTS.send(ConsumerKey::VolumeUp).await;
+            }
         } else if accumulator <= -4 {
             accumulator = 0;
-            CONSUMER_EVENTS.send(ConsumerKey::VolumeDown).await;
+            let menu_open = DISPLAY_STATE.lock(|s| {
+                let mut s = s.borrow_mut();
+                if s.menu_open {
+                    s.menu_selection = (s.menu_selection + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !menu_open {
+                CONSUMER_EVENTS.send(ConsumerKey::VolumeDown).await;
+            }
         }
     }
 }
