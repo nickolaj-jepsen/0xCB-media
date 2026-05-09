@@ -30,9 +30,12 @@ type VizSlot = Arc<ArcSwapOption<[u8; 8]>>;
 #[derive(Parser, Debug)]
 #[command(version, about = "0xCB-media host daemon")]
 struct Args {
-    /// CDC ACM serial device exposed by the macropad. Reads
-    /// `OXCB_MEDIA_SERIAL` so the systemd unit can pass the path in via env.
-    #[arg(long, default_value = "/dev/ttyACM0", env = "OXCB_MEDIA_SERIAL")]
+    /// CDC ACM serial device exposed by the macropad. `auto` (the default)
+    /// scans `serialport::available_ports()` for the 0xCB:1337 USB VID:PID
+    /// and uses the first match. An explicit path (e.g. `/dev/ttyACM0`)
+    /// bypasses the scan. Reads `OXCB_MEDIA_SERIAL` so the systemd unit can
+    /// pin the path via env.
+    #[arg(long, default_value = "auto", env = "OXCB_MEDIA_SERIAL")]
     device: String,
 
     /// Baud rate. CDC ACM ignores this but `serialport` still wants a value.
@@ -115,6 +118,53 @@ fn main() -> Result<()> {
 
 // ─── Serial main loop (interleaved RX + TX, single thread) ─────────────────
 
+/// USB descriptor identifiers set in `firmware/src/main.rs` (VID 0xCB00,
+/// PID 0x1337). Used to find the macropad among other CDC ACM devices.
+const DEVICE_VID: u16 = 0xCB00;
+const DEVICE_PID: u16 = 0x1337;
+
+/// Resolve the `--device` argument to a concrete serial port name.
+///
+/// `arg == "auto"` triggers a USB enumeration; any other value is treated as
+/// an explicit device path and returned verbatim. On `auto`, all CDC ACM
+/// ports matching the firmware's VID:PID are logged and the first is
+/// returned. Errors propagate back into `serial_loop`'s 2 s reopen backoff so
+/// a hot replug recovers without restarting the daemon.
+fn resolve_device(arg: &str) -> Result<String> {
+    if arg != "auto" {
+        return Ok(arg.to_string());
+    }
+
+    let ports = serialport::available_ports().context("serialport::available_ports")?;
+    let matches: Vec<String> = ports
+        .into_iter()
+        .filter_map(|p| match p.port_type {
+            serialport::SerialPortType::UsbPort(info)
+                if info.vid == DEVICE_VID && info.pid == DEVICE_PID =>
+            {
+                Some(p.port_name)
+            }
+            _ => None,
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => anyhow::bail!(
+            "no USB device matching {:04X}:{:04X} found",
+            DEVICE_VID,
+            DEVICE_PID
+        ),
+        [only] => Ok(only.clone()),
+        many => {
+            info!(
+                "multiple {:04X}:{:04X} devices found ({:?}); using {}",
+                DEVICE_VID, DEVICE_PID, many, many[0]
+            );
+            Ok(many[0].clone())
+        }
+    }
+}
+
 fn serial_loop(device: &str, baud: u32, rx: Receiver<HostToDevice>, viz: VizSlot) -> Result<()> {
     let mut tx_buf = [0u8; 256];
     let mut rx_frame = [0u8; proto::MAX_FRAME_LEN];
@@ -124,8 +174,16 @@ fn serial_loop(device: &str, baud: u32, rx: Receiver<HostToDevice>, viz: VizSlot
     let viz_min_interval = Duration::from_millis(15);
 
     loop {
-        info!("opening {}", device);
-        let mut port = match serialport::new(device, baud)
+        let resolved = match resolve_device(device) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("device resolve failed: {}; retry in 2 s", e);
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        info!("opening {}", resolved);
+        let mut port = match serialport::new(&resolved, baud)
             // Short timeout — main loop just polls, never long-blocks on reads.
             .timeout(Duration::from_millis(10))
             .open()
