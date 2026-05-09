@@ -518,12 +518,17 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
     };
     const ACCENT_PERKEY: RGB8 = RGB8 { r: 96, g: 12, b: 0 };
     const PRESS_DECAY: u8 = 18;
-    const TICK_MS: u64 = 16; // ~60 Hz idle/press render
-                             // Volume gauge: when the host pushes a Volume frame, fill the underglow
-                             // ring proportionally to `level / 100`. Held at full intensity for
-                             // VOL_GAUGE_HOLD_MS, then fades to black across VOL_GAUGE_FADE_MS so the
-                             // ring returns to the idle dark state. Sub-LED precision (1 LED = 256
-                             // units) keeps the leading edge smooth at 1 % volume increments.
+    // 60 Hz while anything's animating, 10 Hz when fully idle. Idle cuts
+    // ~83 % of the WS2812 chain writes when nothing's lit, with up to 100 ms
+    // of latency to wake the viz once audio resumes (matrix + volume events
+    // wake immediately via LED_EVENTS).
+    const ACTIVE_TICK_MS: u64 = 16;
+    const IDLE_TICK_MS: u64 = 100;
+    // Volume gauge: when the host pushes a Volume frame, fill the underglow
+    // ring proportionally to `level / 100`. Held at full intensity for
+    // VOL_GAUGE_HOLD_MS, then fades to black across VOL_GAUGE_FADE_MS so the
+    // ring returns to the idle dark state. Sub-LED precision (1 LED = 256
+    // units) keeps the leading edge smooth at 1 % volume increments.
     const VOL_GAUGE_HOLD_MS: u32 = 1500;
     const VOL_GAUGE_FADE_MS: u32 = 700;
     const VOL_GAUGE_TOTAL_MS: u64 = (VOL_GAUGE_HOLD_MS + VOL_GAUGE_FADE_MS) as u64;
@@ -560,10 +565,16 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
 
     let mut press_brightness: [u8; 8] = [0; 8];
     let mut effect: Option<UnderglowEffect> = None;
-    let mut ticker = Ticker::every(Duration::from_millis(TICK_MS));
+    let mut current_tick_ms: u64 = ACTIVE_TICK_MS;
+    let mut ticker = Ticker::every(Duration::from_millis(current_tick_ms));
 
     loop {
-        ticker.next().await;
+        // Wake on either the (possibly idle-rate) ticker or any LED_EVENTS
+        // arrival — the drain below still consumes the message, so this
+        // select is purely a wakeup. The viz frame path doesn't push to
+        // LED_EVENTS, so on viz transitions we wait up to IDLE_TICK_MS to
+        // notice — acceptable per the plan.
+        select(ticker.next(), LED_EVENTS.ready_to_receive()).await;
 
         while let Ok(cmd) = LED_EVENTS.try_receive() {
             match cmd {
@@ -692,6 +703,17 @@ async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Grb>) {
                     }
                 }
             }
+        }
+
+        // Cap the per-key and underglow rates: if everything is fully dark
+        // and no effect is mid-fade, drop to IDLE_TICK_MS until something
+        // wakes us. Recreating a Ticker with a new period fires immediately
+        // on the next .next(), so the transition isn't sticky.
+        let idle = press_brightness.iter().all(|&b| b == 0) && effect.is_none() && !viz_active;
+        let target_ms = if idle { IDLE_TICK_MS } else { ACTIVE_TICK_MS };
+        if target_ms != current_tick_ms {
+            current_tick_ms = target_ms;
+            ticker = Ticker::every(Duration::from_millis(current_tick_ms));
         }
 
         ws2812.write(&frame).await;
