@@ -22,6 +22,7 @@ mod display;
 mod input;
 mod led;
 mod state;
+mod storage;
 mod usb;
 
 use defmt::info;
@@ -30,7 +31,7 @@ use embassy_futures::join::join;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::i2c::{self, I2c};
-use embassy_rp::peripherals::{DMA_CH0, I2C1, PIO0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C1, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
@@ -56,7 +57,10 @@ use crate::usb::{
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
+    // RP2040 has a single DMA_IRQ_0 shared by every channel; each
+    // `InterruptHandler<T>` only services its own channel's wakers, so we
+    // bind one per channel we use async-style (CH0 = WS2812, CH1 = flash).
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>, embassy_rp::dma::InterruptHandler<DMA_CH1>;
     I2C1_IRQ => i2c::InterruptHandler<I2C1>;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
@@ -91,6 +95,23 @@ async fn main(spawner: Spawner) {
     }
 
     info!("0xCB-media firmware booted (M7)");
+
+    // Persisted settings: load before tasks spawn so the first viz/glow
+    // frame already reflects the user's last choice. Must run after the
+    // bootmagic check above — that's the only recovery path if flash logic
+    // ever goes wrong.
+    let flash =
+        embassy_rp::flash::Flash::<_, embassy_rp::flash::Async, { storage::FLASH_SIZE }>::new(
+            p.FLASH, p.DMA_CH1, Irqs,
+        );
+    let flash = storage::init(flash);
+    let settings = storage::load(flash).await;
+    state::DISPLAY_STATE.lock(|d| {
+        let mut d = d.borrow_mut();
+        d.oled_viz = settings.oled_viz;
+        d.glow_viz = settings.glow_viz;
+        d.hue_mode = settings.hue_mode;
+    });
 
     // RGB load switch on, settle.
     let _rgb_enable = Output::new(p.PIN_14, Level::High);
@@ -173,7 +194,7 @@ async fn main(spawner: Spawner) {
     let usb = builder.build();
     spawner.spawn(usb_task(usb).expect("usb_task spawn"));
     spawner.spawn(hid_writer_task(hid_writer).expect("hid_writer_task spawn"));
-    spawner.spawn(matrix_task(matrix).expect("matrix_task spawn"));
+    spawner.spawn(matrix_task(matrix, flash).expect("matrix_task spawn"));
     spawner.spawn(cdc_tx_task(cdc_tx).expect("cdc_tx_task spawn"));
 
     info!("USB started; awaiting host connection");

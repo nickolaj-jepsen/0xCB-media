@@ -14,6 +14,20 @@ use crate::state::{
     apply_encoder_step, ConsumerKey, LedCommand, MenuView, Selector, CONSUMER_EVENTS,
     DEVICE_TX_EVENTS, DISPLAY_STATE, LED_EVENTS,
 };
+use crate::storage::{self, Settings, SharedFlash};
+
+/// Snapshot the persistable fields out of `DISPLAY_STATE` and write them to
+/// flash. Snapshot inside the blocking lock; await flash work outside —
+/// `DISPLAY_STATE` is `CriticalSectionRawMutex`, holding it across `.await`
+/// would deadlock.
+async fn save_settings(flash: &'static SharedFlash) {
+    let snap = DISPLAY_STATE.lock(|s| {
+        let s = s.borrow();
+        let (oled_viz, glow_viz, hue_mode) = s.settings_snapshot();
+        Settings::new(oled_viz, glow_viz, hue_mode)
+    });
+    storage::save(flash, &snap).await;
+}
 
 /// Maps the 3×3 matrix slot (row-major) to the index of the per-key
 /// SK6812MINI-E LED on the WS2812 chain. The chain order matches the
@@ -47,7 +61,7 @@ const KEYMAP: [Option<ConsumerKey>; 9] = [
 ];
 
 #[embassy_executor::task]
-pub async fn matrix_task(matrix: [Input<'static>; 9]) {
+pub async fn matrix_task(matrix: [Input<'static>; 9], flash: &'static SharedFlash) {
     const DEBOUNCE_TICKS: u8 = 5;
     let mut counters: [u8; 9] = [0; 9];
     let mut pressed: [bool; 9] = [false; 9];
@@ -100,9 +114,10 @@ pub async fn matrix_task(matrix: [Input<'static>; 9]) {
                 //   Main + sel 3       → enter USB bootloader (no return)
                 //   Sub(_)             → back to Main
                 if i == 5 {
-                    let enter_bootloader = DISPLAY_STATE.lock(|s| {
+                    let (was_in_sub, enter_bootloader) = DISPLAY_STATE.lock(|s| {
                         let mut s = s.borrow_mut();
-                        match s.menu {
+                        let was_in_sub = matches!(s.menu, MenuView::Sub(_));
+                        let bootloader = match s.menu {
                             MenuView::Closed => {
                                 s.menu = MenuView::Main;
                                 s.main_selection = 0;
@@ -128,8 +143,12 @@ pub async fn matrix_task(matrix: [Input<'static>; 9]) {
                                 s.menu = MenuView::Main;
                                 false
                             }
-                        }
+                        };
+                        (was_in_sub, bootloader)
                     });
+                    if was_in_sub {
+                        save_settings(flash).await;
+                    }
                     // Bootloader entry: identical to the boot-time bootmagic
                     // path, just user-triggered from the menu instead of
                     // requiring a re-plug while holding the encoder.
@@ -141,17 +160,22 @@ pub async fn matrix_task(matrix: [Input<'static>; 9]) {
                     }
                 }
                 // matrix[8] (bottom-right) is the back/close key:
-                //   Sub(_) → Main (back one level)
+                //   Sub(_) → Main (back one level, persists settings)
                 //   Main   → Closed (exit menu)
                 // Unbound when menu isn't open.
                 if i == 8 && menu_open {
-                    DISPLAY_STATE.lock(|s| {
+                    let was_in_sub = DISPLAY_STATE.lock(|s| {
                         let mut s = s.borrow_mut();
+                        let was_in_sub = matches!(s.menu, MenuView::Sub(_));
                         s.menu = match s.menu {
                             MenuView::Sub(_) => MenuView::Main,
                             _ => MenuView::Closed,
                         };
+                        was_in_sub
                     });
+                    if was_in_sub {
+                        save_settings(flash).await;
+                    }
                 }
             }
         }

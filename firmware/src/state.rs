@@ -11,6 +11,7 @@ use embassy_sync::blocking_mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 
 use proto::{DeviceToHost, HostToDevice};
 
@@ -61,7 +62,7 @@ pub struct VolumeInfo {
 /// OLED visualizer style. To add a new style: add a variant, list it in `ALL`,
 /// label it in `label()` / `long_label()`, and add a render arm in
 /// `render_frame`.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum OledViz {
     Bars,
     Waterfall,
@@ -114,7 +115,7 @@ impl OledViz {
 }
 
 /// Underglow visualizer style. Same extension recipe as `OledViz`.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum GlowViz {
     Spec,
     Ripple,
@@ -153,7 +154,7 @@ impl GlowViz {
 
 /// Underglow accent colour mode. `Static` pins the warm-orange accent;
 /// `Dynamic` shifts it redder on bass and warmer on treble per frame.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum HueMode {
     Static,
     Dynamic,
@@ -275,6 +276,12 @@ impl DisplayState {
 
     pub fn menu_open(&self) -> bool {
         !matches!(self.menu, MenuView::Closed)
+    }
+
+    /// The persistable triple. `storage::save` snapshots these inside the
+    /// blocking lock and writes outside of it.
+    pub fn settings_snapshot(&self) -> (OledViz, GlowViz, HueMode) {
+        (self.oled_viz, self.glow_viz, self.hue_mode)
     }
 }
 
